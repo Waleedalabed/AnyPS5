@@ -240,16 +240,14 @@ __attribute__((noinline)) static void APS5_VABI RunChecks() {
     Require(sscanf_nid_postfix("", "%d", &scanned) == EOF);
 #else
     char16_t wide[4] = {u'!', u'!', u'!', u'!'};
-    const auto rejects = [&](const char* format) {
-        try { sscanf_nid_postfix("ab cd", format, wide); } catch (const std::runtime_error&) { return wide[0] == u'!'; }
-        return false;
-    };
-    Require(rejects("%ls") && rejects("%*s %3lc") && rejects("%l[a-z]") && rejects("%S") && rejects("%2$C") && rejects("%'ls"));
-    const auto secureRejects = [&](const char* format) {
-        try { ScanListS("ab cd", format, wide, 4u); } catch (const std::runtime_error&) { return wide[0] == u'!'; }
-        return false;
-    };
-    Require(secureRejects("%ls") && secureRejects("%lc"));
+    Require(sscanf_nid_postfix("ab cd", "%ls", wide) == 1 && wide[0] == u'a' && wide[1] == u'b' && wide[2] == 0);
+    Require(sscanf_nid_postfix("ab cd", "%*s %2lc", wide) == 1 && wide[0] == u'c' && wide[1] == u'd');
+    Require(sscanf_nid_postfix("ab cd", "%'ls", wide) == 1 && wide[0] == u'a' && wide[2] == 0);
+    bool positional = false;
+    try { sscanf_nid_postfix("ab cd", "%2$C", wide); } catch (const std::invalid_argument&) { positional = true; }
+    Require(positional);
+    Require(ScanListS("ab cd", "%ls", wide, 4u) == 1 && wide[0] == u'a' && wide[2] == 0);
+    Require(ScanListS("abcd", "%ls", wide, 4u) == 0 && wide[0] == 0);
     char narrow[8] = {};
     Require(sscanf_nid_postfix("ab%", "%7[^%ls]", narrow) == 1 && std::strcmp(narrow, "ab") == 0);
 #endif
