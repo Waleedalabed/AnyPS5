@@ -1,13 +1,23 @@
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
+#ifndef _WIN32
+extern "C" void* __tls_get_addr(void* index);
+#endif
+
 extern "C" {
 
-int APS5_VABI __tls_get_addr_nid_postfix(void) {
-    NotImplemented_nid_no_patch("vNe1w4diLCs");
-    return 0;
+void* APS5_VABI __tls_get_addr_nid_postfix(void* index) {
+#ifdef _WIN32
+    (void)index;
+    throw std::runtime_error("__tls_get_addr: the Windows relinker rejects DTPMOD64 relocations, so no module index can reach this call");
+#else
+    if (!index) throw std::invalid_argument("__tls_get_addr: null TLS index");
+    return __tls_get_addr(index);
+#endif
 }
 
 APS5_EXPORT("AC1FtjqMCL0", sceKernelUnknown03);
