@@ -7,7 +7,18 @@
 
 extern "C" {
 int APS5_VABI sceNpGetNpId(int user_id, NpId* np_id);
+int APS5_VABI sceNpGetUserIdByAccountId(std::uint64_t accountId, int* userId);
+int APS5_VABI sceNpSetContentRestriction(const void* restriction);
+void APS5_VABI sceNpRegisterGamePresenceCallback(void* callback, void* userdata);
 }
+
+struct ContentRestriction {
+    std::uint64_t size;
+    std::int8_t defaultAgeRestriction;
+    std::uint8_t padding[3];
+    std::int32_t ageRestrictionCount;
+    const void* ageRestriction;
+};
 
 extern "C" {
 int APS5_VABI sceNpCreateRequest(void);
@@ -67,5 +78,24 @@ int main() {
     Require(sceNpGetNpId(0x10000, &npId) == SignedOut, "sceNpGetNpId must report the user as signed out");
     Require(std::memcmp(&npId, &untouched, sizeof(npId)) == 0, "sceNpGetNpId must leave the NpId untouched");
     Require(sceNpGetNpId(0x10000, nullptr) == InvalidArgument, "sceNpGetNpId must reject a null NpId");
+    int userId = -1;
+    Require(sceNpGetUserIdByAccountId(0x1234, &userId) == SignedOut && userId == -1, "account lookup while signed out");
+    Require(sceNpGetUserIdByAccountId(0, &userId) == InvalidArgument, "account id 0");
+    Require(sceNpGetUserIdByAccountId(0x1234, nullptr) == InvalidArgument, "null user id");
+    const std::uint8_t ages[8]{};
+    ContentRestriction restriction{sizeof(ContentRestriction), 12, {}, 0, nullptr};
+    Require(sceNpSetContentRestriction(&restriction) == 0, "valid content restriction");
+    restriction.ageRestrictionCount = 1;
+    Require(sceNpSetContentRestriction(&restriction) == InvalidArgument, "count without a list");
+    restriction.ageRestriction = ages;
+    Require(sceNpSetContentRestriction(&restriction) == 0, "restriction list");
+    restriction.ageRestrictionCount = 0x101;
+    Require(sceNpSetContentRestriction(&restriction) == InvalidArgument, "too many restrictions");
+    restriction = {sizeof(ContentRestriction), -1, {}, 0, nullptr};
+    Require(sceNpSetContentRestriction(&restriction) == InvalidArgument, "negative default age");
+    restriction = {16, 0, {}, 0, nullptr};
+    Require(sceNpSetContentRestriction(&restriction) == static_cast<int>(0x80550011u), "wrong size");
+    Require(sceNpSetContentRestriction(nullptr) == InvalidArgument, "null restriction");
+    sceNpRegisterGamePresenceCallback(nullptr, nullptr);
     return 0;
 }
