@@ -12,6 +12,7 @@
 extern "C" {
 int APS5_VABI scePadOpen_nid_postfix(int, int, int, const void*);
 int APS5_VABI scePadOpenExt(int, int, int, const void*);
+int APS5_VABI scePadReadExt(int, PadData*, int);
 int APS5_VABI scePadClose_nid_postfix(int);
 int APS5_VABI scePadGetHandle(int, int, int);
 int APS5_VABI scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool);
@@ -176,6 +177,11 @@ static void CheckReadQueue(int handle) {
     Require(data[0].timestamp <= data[1].timestamp);
     Require(scePadRead_nid_postfix(handle, data, 4) == 1);
     Require(data[0].buttons == 0);
+    PadPublishInput_nid_postfix(pressed);
+    Require(scePadReadExt(handle, data, 4) == 1);
+    Require((data[0].buttons & pressed.buttons) != 0);
+    PadPublishInput_nid_postfix(PadInputState{});
+    scePadRead_nid_postfix(handle, drained, 64);
 }
 
 static void CheckReadStateHandle(int handle) {
@@ -285,6 +291,9 @@ int main() {
     Require(scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == static_cast<int>(0x80920007));
     Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
     Require(scePadGetHandle(user, 0, 0) == handle);
+    Require(scePadOpenExt(user, 0, 0, wheel) == handle);
+    PadData extended[2]{};
+    Require(scePadReadExt(handle + 1, extended, 2) == PAD_ERROR_INVALID_HANDLE);
     CheckTiltCorrection(handle);
     CheckAngularVelocityDeadband(handle);
     CheckTouchContact();
