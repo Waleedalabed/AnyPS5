@@ -12,6 +12,9 @@ struct NpWebApi2MemoryPoolStats {
 };
 
 extern "C" {
+int APS5_VABI sceNpWebApi2AddWebTraceTag(std::int64_t, const char*);
+int APS5_VABI sceNpWebApi2PushEventAbortHandle(int, int);
+int APS5_VABI sceNpWebApi2PushEventCreateHandle(int);
 int APS5_VABI sceNpWebApi2Initialize(int, std::size_t);
 int APS5_VABI sceNpWebApi2Terminate(int);
 int APS5_VABI sceNpWebApi2GetMemoryPoolStats(int, NpWebApi2MemoryPoolStats*);
@@ -56,5 +59,8 @@ int main() {
     Require(Throws([&] { sceNpWebApi2GetMemoryPoolStats(context, &stats); }));
     Require(Throws([&] { sceNpWebApi2PushEventSetHandleTimeout(context, handle, 30000); }));
     Require(sceNpWebApi2Terminate(other) == 0);
+    Require(sceNpWebApi2AddWebTraceTag(1, "tag") == 0);
+    Require(sceNpWebApi2AddWebTraceTag(1, nullptr) == static_cast<int>(0x80553402));
+    Require(sceNpWebApi2PushEventAbortHandle(context, sceNpWebApi2PushEventCreateHandle(context)) == 0);
     return 0;
 }
