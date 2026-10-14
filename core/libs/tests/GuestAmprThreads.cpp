@@ -66,6 +66,10 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp);
 int APS5_VABI _Cnd_signal_nid_postfix(void** handle);
 int APS5_VABI _Cnd_init_with_name_nid_postfix(void** handle, const char* name);
 int APS5_VABI _Cnd_init_nid_postfix(void** handle);
+unsigned int APS5_VABI _Thrd_id_nid_postfix(void);
+int APS5_VABI pthread_getthreadid_np_nid_postfix(void);
+extern std::uint64_t _ZNSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix;
+extern std::uint64_t _ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix;
 void APS5_VABI _Cnd_destroy_nid_postfix(void** handle);
 int APS5_VABI _Cnd_wait_nid_postfix(void** condition, void** mutex);
 int APS5_VABI _Cnd_broadcast_nid_postfix(void** handle);
@@ -528,7 +532,23 @@ static void TestPadErrors() {
     Require(Throws<std::invalid_argument>([&] { _ZNSt4_PadD2Ev_nid_postfix(&pad); }));
 }
 
+static void TestThreadId() {
+    const unsigned int self = _Thrd_id_nid_postfix();
+    Require(self == static_cast<unsigned int>(pthread_getthreadid_np_nid_postfix()));
+    Require(self == _Thrd_id_nid_postfix());
+    unsigned int other = self;
+    std::thread([&] { other = _Thrd_id_nid_postfix(); }).join();
+    Require(other != self);
+}
+
+static void TestFacetIds() {
+    Require(_ZNSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix == 0);
+    Require(_ZNSt8time_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_nid_postfix == 0);
+}
+
 int main() {
+    TestThreadId();
+    TestFacetIds();
     TestPadLaunch();
     TestPadLaunchMany();
     TestPadConcurrentLaunch();
