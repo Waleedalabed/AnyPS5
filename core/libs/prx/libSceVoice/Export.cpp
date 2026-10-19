@@ -1,12 +1,14 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -20,13 +22,21 @@ constexpr std::int32_t PortOutVoice = 4;
 constexpr std::int32_t PortOutDevice = 5;
 constexpr std::int32_t PortStateReady = 1;
 constexpr std::uint32_t VoiceFrameMs = 20;
+constexpr std::uint32_t PortQueueFrames = 5;
+constexpr std::uint32_t PcmFallbackFrameBytes = 3840;
 constexpr std::int32_t PortAttrVoiceActivity = 1001;
+
+struct VoicePacket {
+    std::vector<std::uint8_t> data;
+    std::uint32_t frames;
+};
 
 struct Port {
     std::int32_t type;
     float volume;
     std::uint32_t bitrate;
     bool muted = false;
+    std::deque<VoicePacket> packets;
 };
 
 struct Voice {
@@ -56,6 +66,28 @@ Port& RequirePort(Voice& voice, std::uint32_t id, const char* function) {
 }
 
 bool IsInput(std::int32_t type) { return type == PortInDevice || type == PortInPcm || type == PortInVoice; }
+
+std::uint32_t FrameBytes(std::uint32_t bitrate) {
+    if (bitrate == 0) return 0;
+    return static_cast<std::uint32_t>((static_cast<std::uint64_t>(bitrate) * VoiceFrameMs + 7999u) / 8000u);
+}
+
+std::size_t QueueFrameBytes(const Port& port) {
+    const std::uint32_t voice = FrameBytes(port.bitrate);
+    return voice != 0 ? voice : PcmFallbackFrameBytes;
+}
+
+std::uint32_t QueuedFrames(const Port& port) {
+    std::uint32_t queued = 0;
+    for (const auto& packet : port.packets) queued += packet.frames;
+    return queued;
+}
+
+std::size_t QueuedBytes(const Port& port) {
+    std::size_t queued = 0;
+    for (const auto& packet : port.packets) queued += packet.data.size();
+    return queued;
+}
 
 }
 
@@ -178,7 +210,7 @@ int APS5_VABI sceVoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
     *info = VoicePortInfo{};
     info->port_type = port.type;
     info->state = PortStateReady;
-    if (port.bitrate != 0) info->frame_size = (port.bitrate * VoiceFrameMs + 7999u) / 8000u;
+    if (port.bitrate != 0) info->frame_size = FrameBytes(port.bitrate);
     return 0;
 }
 
@@ -204,11 +236,21 @@ int APS5_VABI sceVoiceReadFromOPort(uint32_t output_port_id, void* data, uint32_
 }
 
 int APS5_VABI sceVoiceWriteToIPort(uint32_t input_port_id, const void* data, uint32_t* size, int16_t frame_gaps) {
-    (void)input_port_id;
-    (void)data;
-    (void)size;
-    (void)frame_gaps;
-    NotImplemented_nid_no_patch(__func__);
+    if (data == nullptr || size == nullptr) APS5_INVALID_ARG_EX;
+    if (frame_gaps < 0) Fail(__func__, "negative frame gaps " + std::to_string(frame_gaps));
+    auto& voice = State();
+    std::lock_guard lock(voice.mutex);
+    auto& port = RequirePort(voice, input_port_id, __func__);
+    if (!IsInput(port.type)) Fail(__func__, "port is not an input port");
+    const auto bytes = *size;
+    *size = 0;
+    if (bytes == 0) return 0;
+    const auto frames = 1u + static_cast<std::uint32_t>(frame_gaps);
+    if (QueuedFrames(port) + frames > PortQueueFrames) return 0;
+    if (QueuedBytes(port) + bytes > QueueFrameBytes(port) * PortQueueFrames) return 0;
+    const auto* source = static_cast<const std::uint8_t*>(data);
+    port.packets.push_back(VoicePacket{std::vector<std::uint8_t>(source, source + bytes), frames});
+    *size = bytes;
     return 0;
 }
 
@@ -251,7 +293,8 @@ int APS5_VABI sceVoiceEnableChat(void) {
 int APS5_VABI sceVoiceResetPort(uint32_t port_id) {
     auto& voice = State();
     std::lock_guard lock(voice.mutex);
-    RequirePort(voice, port_id, __func__);
+    auto& port = RequirePort(voice, port_id, __func__);
+    port.packets.clear();
     return 0;
 }
 
