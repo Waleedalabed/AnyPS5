@@ -145,7 +145,7 @@ SaveDataParam load_param(const std::string& real_path) {
         std::error_code ec;
         const auto written = std::filesystem::last_write_time(real_path, ec);
         if (!ec) {
-            const auto system = std::filesystem::file_time_type::clock::to_sys(written);
+            const auto system = std::chrono::file_clock::to_sys(written);
             param.mtime = std::chrono::duration_cast<std::chrono::seconds>(system.time_since_epoch()).count();
         }
     }
@@ -217,6 +217,7 @@ int APS5_VABI sceSaveDataCommit(const SaveDataCommitParam* param) {
 
 int APS5_VABI sceSaveDataCreateTransactionResource(uint32_t size) {
     (void)size;
+    if (g_initializations == 0) return SAVE_DATA_ERROR_NOT_INITIALIZED;
     return g_transaction_counter.fetch_add(1);
 }
 
@@ -271,6 +272,7 @@ int APS5_VABI sceSaveDataDelete(const SaveDataDelete* del) {
 
 int APS5_VABI sceSaveDataDeleteTransactionResource(int32_t resource) {
     (void)resource;
+    if (g_initializations == 0) return SAVE_DATA_ERROR_NOT_INITIALIZED;
     return SAVE_DATA_OK;
 }
 
@@ -403,7 +405,7 @@ int APS5_VABI sceSaveDataGetEventResult(const void* event_param, SaveDataEvent* 
 
 static int getMountInfo(const SaveDataMountPoint* mount_point, SaveDataMountInfo* info) {
     if (mount_point == nullptr || info == nullptr) {
-        throw std::runtime_error("sceSaveDataGetMountInfo: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     const int slot = find_slot_by_mount_point(mount_point->data);
@@ -425,7 +427,7 @@ int APS5_VABI sceSaveDataGetMountInfo(const SaveDataMountPoint* mount_point, Sav
 
 static int getParam(const SaveDataMountPoint* mount_point, uint32_t param_type, void* param_buf, size_t param_buf_size, size_t* got_size) {
     if (mount_point == nullptr || param_buf == nullptr) {
-        throw std::runtime_error("sceSaveDataGetParam: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     const int slot = find_slot_by_mount_point(mount_point->data);
@@ -529,11 +531,11 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     }
     const auto* nameEnd = static_cast<const char*>(std::memchr(mount->dir_name->data, '\0', sizeof(mount->dir_name->data)));
     if (nameEnd == nullptr) {
-        throw std::runtime_error("sceSaveDataMount3: unterminated directory name");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     const std::string dirName(mount->dir_name->data, static_cast<std::size_t>(nameEnd - mount->dir_name->data));
     if (dirName.empty() || dirName == "." || dirName == ".." || dirName.find_first_of("/\\:") != std::string::npos) {
-        throw std::runtime_error("sceSaveDataMount3: invalid directory name");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     const std::string real_path = save_root() + "/" + dirName;
     std::lock_guard lock(g_slots_mutex);
@@ -576,7 +578,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
 
 int APS5_VABI sceSaveDataMount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result) {
     const int rc = mount3(mount, mount_result);
-    SAVEDATA_TRACE("mount3 user=%d dir=%s mode=0x%x blocks=%llu -> 0x%08x point=%s status=%u", mount != nullptr ? mount->user_id : -1, mount != nullptr && mount->dir_name != nullptr ? mount->dir_name->data : "(null)", mount != nullptr ? mount->mount_mode : 0u, mount != nullptr ? static_cast<unsigned long long>(mount->blocks) : 0ull, static_cast<unsigned>(rc), mount_result != nullptr ? mount_result->mount_point.data : "", mount_result != nullptr ? mount_result->mount_status : 0u);
+    SAVEDATA_TRACE("mount3 user=%d dir=%.*s mode=0x%x blocks=%llu -> 0x%08x point=%.*s status=%u", mount != nullptr ? mount->user_id : -1, static_cast<int>(sizeof(SceSaveDataDirName::data)), mount != nullptr && mount->dir_name != nullptr ? mount->dir_name->data : "(null)", mount != nullptr ? mount->mount_mode : 0u, mount != nullptr ? static_cast<unsigned long long>(mount->blocks) : 0ull, static_cast<unsigned>(rc), static_cast<int>(sizeof(SaveDataMountPoint::data)), mount_result != nullptr ? mount_result->mount_point.data : "", mount_result != nullptr ? mount_result->mount_status : 0u);
     return rc;
 }
 
@@ -893,9 +895,8 @@ int APS5_VABI sceSaveDataDirNameSearch2(const SaveDataDirNameSearchCond* cond, S
     return rc;
 }
 
-APS5_EXPORT("RvID8BVeg+g", sceSaveDataUnknown_RvID8BVeg);
-int APS5_VABI sceSaveDataUnknown_RvID8BVeg() {
-    NotImplemented_nid_no_patch("RvID8BVeg+g");
+int APS5_VABI sceSaveDataPrepareForTransferring() {
+    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 

@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "StencilReplay.hpp"
 #include <algorithm>
 #include <cstring>
 #include <atomic>
@@ -108,7 +109,14 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
-    const auto* tessellation = request.graphics && request.graphics->tessellation ? &*request.graphics->tessellation : nullptr;
+    std::optional<TessellationConfiguration> tessellationCopy;
+    if (request.graphics && request.graphics->tessellation) {
+        tessellationCopy = *request.graphics->tessellation;
+        tessellationCopy->instancePatches = TessellationInstancePatches(request);
+        const auto& capabilities = request.target.supportedCapabilities;
+        tessellationCopy->drawParameters = std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != capabilities.end();
+    }
+    const auto* tessellation = tessellationCopy ? &*tessellationCopy : nullptr;
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation);
 }
 
@@ -124,7 +132,7 @@ std::atomic<std::uint64_t> frontEndBuilds{0};
 
 struct PreparedControlFlow {
     PreparedControlFlow(const RecompileRequest& request, const SwappcInfo& swappcInfo)
-        : stage(request.shader.stage), swappc(swappcInfo), code(request.shader.code.begin(), request.shader.code.end()),
+        : stage(request.shader.stage), fallbacks(swappcInfo.linkedCallFallbacks.begin(), swappcInfo.linkedCallFallbacks.end()), swappc(WithFallbacks(swappcInfo, fallbacks)), code(request.shader.code.begin(), request.shader.code.end()),
           decoded(DecodeStageProgram(toShaderStageKind(request.shader.stage), code)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
         Structurizer{}.Structurize(cfg);
     }
@@ -135,10 +143,16 @@ struct PreparedControlFlow {
     bool Matches(const RecompileRequest& request, const SwappcInfo& swappcInfo) const {
         return stage == request.shader.stage && swappc.fetchCallAllowed == swappcInfo.fetchCallAllowed &&
                swappc.userDataBaseRegister == swappcInfo.userDataBaseRegister && swappc.userDataCount == swappcInfo.userDataCount &&
-               std::ranges::equal(code, request.shader.code);
+               std::ranges::equal(fallbacks, swappcInfo.linkedCallFallbacks) && std::ranges::equal(code, request.shader.code);
+    }
+
+    static SwappcInfo WithFallbacks(SwappcInfo info, const std::vector<std::uint32_t>& fallbacks) {
+        info.linkedCallFallbacks = fallbacks;
+        return info;
     }
 
     ShaderStage stage;
+    std::vector<std::uint32_t> fallbacks;
     SwappcInfo swappc;
     std::vector<std::uint32_t> code;
     RdnaProgram decoded;
@@ -147,7 +161,7 @@ struct PreparedControlFlow {
 
 std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFrontend(const RecompileRequest& request) {
     const auto inputInfo = RequestInputInfo(request);
-    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
+    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), 0u, request.context.linkedCallFallbacks};
     static const bool reuse = std::getenv("APS5_NO_PERF_FRONTEND_PAIR") == nullptr;
     if (reuse && frontend != nullptr && frontend->Matches(request, swappc)) {
         return frontend;
@@ -195,6 +209,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
+    translateOptions.interpolationFunctions = supports(spv::CapabilityInterpolationFunction);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
 
@@ -285,6 +300,9 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
+    if (request.context.convertedSamples) {
+        for (auto& image : program.Resources().info.images) image.convertedSamples = true;
+    }
 
     return program;
 }
@@ -310,7 +328,9 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
+    std::vector<std::uint32_t> linkedCallFallbacks;
     std::shared_ptr<const IrResourcePlan> plan;
+    bool runtimeCaptured = false;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -381,7 +401,9 @@ bool diskPlans() {
     return enabled && ShaderDiskCache::Enabled() && !DebugProbeActive();
 }
 
-std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) {
+bool sameLayout(const BindingLayout& left, const BindingLayout& right);
+
+std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr) {
     static PrimedSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
@@ -408,6 +430,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         if (source == nullptr) {
             source = std::make_shared<SourceEntry>();
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
+            source->linkedCallFallbacks.assign(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end());
             auto& bucket = sources[key];
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
@@ -423,6 +446,8 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
     {
         std::lock_guard lock(source->mutex);
         if (source->plan == nullptr) {
+            const bool hasPreparedArtifact = preparedHandle != nullptr && preparedHandle->artifact != nullptr;
+            if (hasPreparedArtifact && (preparedHandle->source != source || !MatchesPreparedShader(request, *preparedHandle))) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the resource plan source");
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
             const bool disk = diskPlans();
             std::vector<std::byte> planKey;
@@ -438,7 +463,9 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 try {
                     ResourceProgram resource(request, preparation, reclaim);
                     source->plan = std::move(resource.plan);
-                    source->program = std::move(resource.program);
+                    if (!hasPreparedArtifact && std::ranges::none_of(source->variants, [&](const auto& variant) { return sameLayout(variant->layout, request.layout); })) {
+                        source->program = std::move(resource.program);
+                    }
                 } catch (...) {
                     if (FailureMemo()) source->planFailure = std::current_exception();
                     throw;
@@ -448,6 +475,25 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         }
     }
     return source;
+}
+
+std::shared_ptr<const IrResourcePlan> acquirePlan(const RecompileRequest& request, const std::shared_ptr<SourceEntry>& source, bool runtimeCapture, const SourceHandle* preparedHandle = nullptr) {
+    for (;;) {
+        {
+            std::lock_guard lock(source->mutex);
+            if (source->plan != nullptr) {
+                if (runtimeCapture) source->runtimeCaptured = true;
+                return source->plan;
+            }
+        }
+        if (getSource(request, nullptr, true, preparedHandle) != source) throw std::runtime_error("ShaderRecompiler: resource plan source changed while reloading");
+    }
+}
+
+void releaseUndrawnPlan(const SourceHandle& handle) {
+    if (handle.source == nullptr || !diskPlans()) return;
+    std::lock_guard lock(handle.source->mutex);
+    if (!handle.source->runtimeCaptured) handle.source->plan.reset();
 }
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
@@ -478,6 +524,12 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     const bool nativeSampleOffsets = request.target.nonConstantImageOffsets && std::find(request.target.supportedCapabilities.begin(), request.target.supportedCapabilities.end(), spv::CapabilityImageGatherExtended) != request.target.supportedCapabilities.end();
     resourceMaterializer.ApplyStaticInterface(program, nativeSampleOffsets);
 
+    constexpr ConstantFolder constantFolder;
+    if (request.shader.stage == ShaderStage::Vertex && constantFolder.FoldVertexLaneBounds(program, HostSubgroupSize(request), request.target.spirvVersion)) {
+        constantFolder.Fold(program);
+        ResolveControlFlowIdentities(program);
+    }
+
     deadCodeEliminator.RemoveIdentities(program);
     constexpr RedundantValueEliminator redundantValueEliminator;
     static_cast<void>(redundantValueEliminator.Eliminate(program));
@@ -492,7 +544,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
     program.Metadata().bindingLayoutComplete = false;
-    auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
+    const bool stencilReplay = request.shader.stage == ShaderStage::Fragment && std::ranges::any_of(program.Info().outputs, [](const StageOutput& output) { return output.kind == StageOutputKind::StencilRef; }) && std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == request.target.supportedCapabilities.end();
+    auto bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
 
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
@@ -504,32 +557,45 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.depthRangeRemap = request.target.depthRangeRemap;
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.spannedWaves = request.target.spannedWaves;
+    targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    SpirvEmitInfo emitted;
+    try {
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+    } catch (const SpannedWaveUnsupported& error) {
+        std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        targetOptions.spannedWaves = false;
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    }
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false);
+        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
         targetOptions.registrationModules = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;
+    result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
+    if (stencilReplay) {
+        result.stencilReferences = StencilReferenceValues(program);
+        result.stencilReferenceDword = bindings.layout.stencilReferenceDword;
+    }
 
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
     result.shaderDataDwords = bindings.layout.ShaderDataDwords();
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
-    for (std::uint32_t index = 0; index < program.Info().images.size(); ++index) {
-        if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage) result.runtimeImageResources.push_back(index);
-    }
     result.hostSubgroupSize = HostSubgroupSize(request);
+    result.fullSubgroups = emitted.fullSubgroups;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -602,15 +668,24 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
+    std::set<std::uint32_t> pushTypes;
+    std::optional<std::uint32_t> replaySlotBytes;
     const auto& words = source.Words();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
+        if (!artifact.stencilReferences.empty() && op == spv::OpTypePointer && count == 4u && words[cursor + 2u] == spv::StorageClassPushConstant) pushTypes.insert(words[cursor + 3u]);
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
             const auto found = supplied.find(words[cursor + 3u]);
-            if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) throw std::runtime_error("missing or duplicate prepared specialization value");
+            if (found == supplied.end()) throw std::runtime_error("missing prepared specialization value");
+            auto value = found->second;
+            if (!artifact.stencilReferences.empty()) {
+                if (found->first == PipelineSpecialization::StencilReferenceOffset) replaySlotBytes = value / PushData::DwordCount * NativePushSlotSize;
+                if (found->first == PipelineSpecialization::StencilReferenceOffset || found->first == PipelineSpecialization::PushDataOffset) value %= PushData::DwordCount;
+            }
+            if (!values.emplace(words[cursor + 1u], value).second) throw std::runtime_error("duplicate prepared specialization value");
             specializedIds.insert(found->first);
         }
         cursor += count;
@@ -622,6 +697,10 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         if (op == spv::OpSpecConstant) {
             if (count != 4u || !values.contains(words[cursor + 2u])) throw std::runtime_error("invalid prepared specialization constant");
             materialized.insert(materialized.end(), {(4u << 16u) | spv::OpConstant, words[cursor + 1u], words[cursor + 2u], values.at(words[cursor + 2u])});
+        } else if (op == spv::OpMemberDecorate && count == 5u && words[cursor + 3u] == spv::DecorationOffset && pushTypes.contains(words[cursor + 1u])) {
+            if (!replaySlotBytes || words[cursor + 2u] != 0u || *replaySlotBytes >= NativePushConstantSize) throw std::runtime_error("invalid stencil replay push constant slot");
+            materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count - 1u);
+            materialized.push_back(*replaySlotBytes);
         } else if (!(op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId)) {
             materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count);
         }
@@ -833,9 +912,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .vertexOffsetConflict = artifact.vertexOffsetConflict,
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
         .hostSubgroupSize = artifact.hostSubgroupSize,
+        .fullSubgroups = artifact.fullSubgroups,
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
+        .stencilReferences = artifact.stencilReferences,
+        .stencilReplaySafe = artifact.stencilReplaySafe,
+        .stencilReferenceDword = artifact.stencilReferenceDword,
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
@@ -845,11 +928,20 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
     moduleKey.clear();
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
+    if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        moduleKey.push_back(request.context.pixel->reversedBlend);
         if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
         if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
+    }
+    const bool depthRemap = request.target.depthRangeRemap && request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value();
+    if (depthRemap) {
+        if (request.context.vertex->depthRemapMode != 0u && request.layout.pushConstantOffsetBytes % (RuntimeAbi::PushConstantDwords * 4u) + request.layout.pushConstantSizeBytes > DepthRemapPushOffsetBytes) {
+            throw std::runtime_error("a remapped vertex shader's push data must end before the depth remap words");
+        }
+        moduleKey.push_back(request.context.vertex->depthRemapMode);
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -879,7 +971,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -893,11 +985,16 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             auto constants = plan->bindings.specialization;
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
+            if (!artifact.stencilReferences.empty()) constants.push_back({PipelineSpecialization::StencilReferenceOffset, moduleKey[index++]});
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+                constants.push_back({PipelineSpecialization::ReversedBlend, moduleKey[index++]});
                 if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
                 if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
+            }
+            if (depthRemap) {
+                for (std::uint32_t word = 0; word < PipelineSpecialization::DepthRemapWords; ++word) constants.push_back({PipelineSpecialization::DepthRemapBase + word, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -930,11 +1027,18 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
+    const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
+    const auto& tables = *resolved;
     BindingAllocationResult bindings;
-    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
+    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    result.readsDepthRemapPush = depthRemap;
+    if (!artifact.stencilReferences.empty()) {
+        if (artifact.stencilReferenceDword * sizeof(std::uint32_t) != result.pushConstants.size() || result.pushConstants.size() + sizeof(std::uint32_t) > request.layout.pushConstantSizeBytes) throw std::runtime_error("stencil replay push constant lies outside the stage range");
+        result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));
+    }
     const auto& layout = variant.bindings.layout;
     if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
         const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;
@@ -948,7 +1052,17 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
         }
     }
+    result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+    if (!tables.map.empty()) {
+        result.imageTablePoison.reserve(tables.poison.size());
+        for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
+        result.imageTableRanges = snapshot.tables.ranges;
+        result.imageTableReadRanges.reserve(snapshot.tables.tables.size());
+        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.push_back(table.readRanges.Copy());
+        result.imageTableShader = snapshot.tables.shader;
+        result.imageTableFaults = tables.faults;
+    }
     return result;
 }
 
@@ -1039,7 +1153,7 @@ RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& 
     return result;
 }
 
-RecompileResult RecompileImpl(const RecompileRequest& request) {
+RecompileResult recompileOnce(const RecompileRequest& request) {
     static_cast<void>(RequestInputInfo(request));
     RequestMemoryView memory(request.context.memory);
     const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
@@ -1053,8 +1167,19 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
-    materializer.Materialize(*source->plan, runtime, snapshot);
+    materializer.Materialize(*acquirePlan(request, source, true), runtime, snapshot);
     return materializeVariant(*source, request, snapshot);
+}
+
+RecompileResult RecompileImpl(const RecompileRequest& request) {
+    try {
+        return recompileOnce(request);
+    } catch (const ConvertedSampleRequired&) {
+        if (request.context.convertedSamples) throw;
+    }
+    auto converted = request;
+    converted.context.convertedSamples = true;
+    return recompileOnce(converted);
 }
 
 // APS5_NO_RESULT_MEMO=1: every Recompile(request, capture) materializes its own result as before.
@@ -1110,6 +1235,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(values.size());
         for (const auto& value : values) {
             mix(value.dwordCount);
+            mix(value.availableDwordMask);
             for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
         }
     };
@@ -1123,12 +1249,32 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    const auto& tables = snapshot.tables;
+    mix(tables.shader);
+    mix(tables.tables.size());
+    for (const auto& table : tables.tables) {
+        mix(table.base);
+        mix(table.size);
+        mix(table.records);
+        mix(table.keys);
+        mix(table.fault);
+        mix(table.outside ? 1u : 0u);
+        mix(table.codes.Hash());
+        mix(table.words.Hash());
+        mix(table.readRanges.Hash());
+    }
+    mix(tables.ranges.size());
+    for (const auto& [base, size] : tables.ranges) {
+        mix(base);
+        mix(size);
+    }
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        mix(request.context.pixel->reversedBlend);
         mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
         mix(request.context.pixel->layerExported);
     }
@@ -1238,8 +1384,15 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
     static_cast<void>(RequestInputInfo(request));
-    if (request.useCache) return getSource(request)->plan;
+    if (request.useCache) {
+        const auto source = getSource(request);
+        return acquirePlan(request, source, false);
+    }
     return makeResourcePlan(request);
+}
+
+void ReleaseUndrawnResourcePlan(const SourceHandle& handle) {
+    releaseUndrawnPlan(handle);
 }
 
 namespace {
@@ -1248,11 +1401,12 @@ namespace {
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
+    SrtRuntime traced = runtime;
+    traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot);
+        ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }
-    SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
     auto& other = capture.readTrace.otherReads;
@@ -1270,7 +1424,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     auto capture = std::make_shared<ResourceCapture>();
     if (request.useCache) {
         capture->source = getSource(request);
-        capture->plan = capture->source->plan;
+        capture->plan = acquirePlan(request, capture->source, true);
     } else {
         capture->plan = makeResourcePlan(request);
     }
@@ -1324,6 +1478,7 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     const auto words = prepared.ShaderDataDwords();
     const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
     if (prepared.UsesPushData() != usesPush) return false;
+    if (!handle.artifact->artifact.stencilReferences.empty() && (prepared.stencilReferenceDword >= layout.pushConstantSizeBytes / 4u || prepared.stencilReferenceDword != (usesPush ? words : 0u))) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
 }
@@ -1333,7 +1488,9 @@ std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle) {
     return handle.source->code;
 }
 
-PreparedShaderInvocation::PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) : request(request), handle(handle) {}
+PreparedShaderInvocation::PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) : request(request), handle(handle) {
+    this->request.context.linkedCallFallbacks = handle->source->linkedCallFallbacks;
+}
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) {
     struct PreparedKeyStorage {};
@@ -1351,13 +1508,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
-    capture->plan = handle->source->plan;
+    capture->plan = acquirePlan(request, handle->source, true, handle.get());
     materializeCapture(*capture, runtime);
     return capture;
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
-    if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1385,7 +1542,7 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
 
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
-    if (capture.source != handle.source || capture.plan != handle.source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle.source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1401,7 +1558,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
-    capture->plan = handle.source->plan;
+    capture->plan = acquirePlan(request, handle.source, true, &handle);
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;

@@ -11,6 +11,39 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_conventions import STUB_BODY, SYSTEM_DEPENDENCY, Check, function_body, links, output
 
+CONVENTIONS_TEST_SHARDS = 12
+
+
+def iter_test_cases(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from iter_test_cases(test)
+        else:
+            yield test
+
+
+def discovered_test_cases():
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    return sorted(iter_test_cases(suite), key=lambda test: test.id())
+
+
+def conventions_test_shard(shard, shard_count=CONVENTIONS_TEST_SHARDS):
+    if shard_count <= 0 or shard < 0 or shard >= shard_count:
+        raise ValueError("shard index must be within the shard count")
+    tests = discovered_test_cases()
+    return unittest.TestSuite(test for index, test in enumerate(tests) if index % shard_count == shard)
+
+
+class TestShardTests(unittest.TestCase):
+    def test_shards_discover_each_case_once(self):
+        discovered = [test.id() for test in discovered_test_cases()]
+        sharded = [test.id() for shard in range(CONVENTIONS_TEST_SHARDS)
+                   for test in iter_test_cases(conventions_test_shard(shard))]
+        self.assertEqual(sorted(sharded), sorted(discovered))
+        self.assertEqual(len(sharded), len(set(sharded)))
+        self.assertTrue(all(len(list(iter_test_cases(conventions_test_shard(shard)))) > 0
+                            for shard in range(CONVENTIONS_TEST_SHARDS)))
+
 
 class FunctionBodyTests(unittest.TestCase):
     def test_line_comments_preserve_following_statements(self):
@@ -122,6 +155,54 @@ class RawLiteralCommentTests(unittest.TestCase):
         for comment in ('// " R"text(https://example.test)text"', '/* " R"text(https://example.test)text" */'):
             with self.subTest(comment=comment):
                 self.assertEqual(self.findings(comment, [1]), [("comment", self.path, 1, "")])
+
+
+class HashCommentTests(unittest.TestCase):
+    def findings(self, path, source, added):
+        check = Check.__new__(Check)
+        check.tree = set()
+        check.status = {}
+        check.findings = []
+        lines = source.split("\n")
+        check.added = {path: [(number, lines[number - 1]) for number in added]}
+        with patch.object(check, "show", return_value=source), patch.object(check, "duplicates"):
+            check.code()
+        return check.findings
+
+    def test_hash_inside_python_multiline_string_is_not_a_comment(self):
+        for quote in ('"""', "'''"):
+            with self.subTest(quote=quote):
+                source = f'TEMPLATE = {quote}\n#include <cstdint>\n{quote}\nprint("#ok")\n'
+                self.assertEqual(self.findings("tools/generate.py", source, [1, 2, 3, 4]), [])
+
+    def test_python_comment_after_a_multiline_string_is_reported(self):
+        source = 'TEMPLATE = """\n#include <cstdint>\n"""  # pending\nvalue = 1 # pending\n'
+        self.assertEqual(self.findings("tools/generate.py", source, [2, 3, 4]),
+                         [("comment", "tools/generate.py", 3, ""), ("comment", "tools/generate.py", 4, "")])
+
+    def test_python_shebang_is_not_a_comment(self):
+        for source in ("#!/usr/bin/env python3\nprint(1)\n", "\ufeff#!/usr/bin/env python3\nprint(1)\n"):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings("tools/generate.py", source, [1, 2]), [])
+
+    def test_unparsable_python_falls_back_to_the_line_check(self):
+        source = 'TEMPLATE = """\n#include <cstdint>\n'
+        self.assertEqual(self.findings("tools/generate.py", source, [2]), [("comment", "tools/generate.py", 2, "")])
+
+    def test_hash_inside_cmake_quoted_and_bracket_arguments_is_not_a_comment(self):
+        for source in ('set(content "#ifndef GUARD\n#define GUARD\n#endif\n")\n',
+                       'set(patch [=[\n#include <utility>\n]=])\n',
+                       'set(patch [[\n#include <utility>\n]])\n',
+                       'message(STATUS "a\\"#b")\n',
+                       'string(REPLACE \\# x out "${in}")\n'):
+            with self.subTest(source=source):
+                added = list(range(1, source.count("\n") + 1))
+                self.assertEqual(self.findings("cmake/Generate.cmake", source, added), [])
+
+    def test_cmake_line_and_bracket_comments_are_reported(self):
+        source = 'set(value 1) # pending\n#[[\npending\n]]\nset(patch [=[\n#include <utility>\n]=]) # pending\n'
+        self.assertEqual(self.findings("CMakeLists.txt", source, [1, 2, 3, 4, 6, 7]),
+                         [("comment", "CMakeLists.txt", number, "") for number in (1, 2, 3, 4, 7)])
 
 
 class SilentStubTests(unittest.TestCase):
@@ -312,7 +393,8 @@ class SilentStubSectionTests(unittest.TestCase):
 
 
 class TestFixtureExportTests(unittest.TestCase):
-    def check(self, path, text):
+    def check(self, path, text=None):
+        files = path if text is None else {path: text}
         checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -334,7 +416,8 @@ class TestFixtureExportTests(unittest.TestCase):
             write("core/libs/prx/libSceNgs2/tests/Render.cpp", "static int APS5_VABI Process(int value) { return value; }\n")
             git("add", ".")
             git("commit", "-qm", "feat: add libraries")
-            write(path, text)
+            for relative, content in files.items():
+                write(relative, content)
             git("add", ".")
             git("commit", "-qm", "feat: add source")
             env = {key: value for key, value in os.environ.items()
@@ -362,6 +445,24 @@ class TestFixtureExportTests(unittest.TestCase):
         self.assertIn("core/libs/prx/libSceAudioOut/src/Clock.cpp:1: error: [duplicate-export]", result.stdout)
         self.assertIn("sceKernelGetProcessTime is also in libkernel", result.stdout)
 
+    def test_comment_in_a_shader_is_reported(self):
+        shaders = {}
+        for path in ("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.comp", "core/libs/prx/libSceAgcDriver/tests/shaders/Fill.frag", "core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.glsl"):
+            for style, line in (("Line", "    // fill the target"), ("Block", "    /* fill the target */")):
+                stem, extension = path.rsplit(".", 1)
+                shaders[f"{stem}{style}.{extension}"] = f"#version 450\nvoid main() {{\n{line}\n}}\n"
+        result = self.check(shaders)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for path in shaders:
+            with self.subTest(path=path):
+                self.assertIn(f"{path}:3: error: [comment]", result.stdout)
+
+    def test_shader_without_comments_passes(self):
+        result = self.check("core/libs/prx/libSceAgcDriver/Graphics/shaders/Fill.vert",
+                            '#version 450\n#define TEXT "a//b"\n#ifdef X\n#endif // X\nvoid main() {}\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
 
 class PullRequestTemplateTests(unittest.TestCase):
     def body_findings(self, body):
@@ -380,6 +481,16 @@ class PullRequestTemplateTests(unittest.TestCase):
 
     def test_checked_item_is_accepted(self):
         self.assertEqual(self.findings("- [x] all"), [])
+
+    def test_depends_on_answered_as_a_list_is_accepted(self):
+        for answer in ("\n  - #3\n  - #4", "\r\n  - #3\r\n  - #4", "\n- #3", "\n  * none"):
+            with self.subTest(answer=answer):
+                body = f"### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on:{answer}\n- [x] AI-assisted: no\n"
+                self.assertEqual(self.body_findings(body), [])
+
+    def test_depends_on_left_empty_before_the_next_item_is_reported(self):
+        body = "### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on:\n- [x] AI-assisted: no\n"
+        self.assertEqual(self.body_findings(body), [("pr-template", "", 0, "fill Depends on with #N or none")])
 
     def test_subsections_stay_inside_their_section(self):
         body = "### What\nx\n### Tested\n#### Linux\nctest\n#### Windows\nctest\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
@@ -498,6 +609,80 @@ class RepositoryChecksTests(unittest.TestCase):
         check.code()
         self.assertIn(("comment", "core/example.cpp", 3, ""), check.findings)
 
+    def test_unchanged_move_preserves_existing_comments_and_extensions(self):
+        source = self.root / "core/tests/Existing.cpp"
+        source.parent.mkdir(parents=True)
+        source.write_text("// existing explanation\n__attribute__((noinline)) int Existing() { return 1; }\n", encoding="utf-8")
+        self.commit()
+        destination = self.root / "core/tests/group/Café example.cpp"
+        destination.parent.mkdir()
+        source.rename(destination)
+        (self.root / "a.bin").write_bytes(b"binary\x00data")
+        (self.root / "README.md").unlink()
+        self.commit()
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        check.repository()
+        name = destination.relative_to(self.root).as_posix()
+        self.assertEqual(check.status[name], "R")
+        self.assertEqual(check.numstat[name], ("0", "0"))
+        self.assertNotIn(name, check.added)
+        self.assertEqual(check.findings, [("binary", "a.bin", 0, "")])
+
+    def test_edited_move_checks_new_lines_at_the_destination(self):
+        source = self.root / "core/tests/Existing.cpp"
+        source.parent.mkdir(parents=True)
+        original = "// existing explanation\n__attribute__((noinline)) int Existing() { return 1; }\n"
+        original += "".join(f"int Existing{index}() {{ return {index}; }}\n" for index in range(12))
+        source.write_text(original, encoding="utf-8")
+        self.commit()
+        destination = self.root / "core/tests/group/Edited.cpp"
+        destination.parent.mkdir()
+        source.rename(destination)
+        destination.write_text(original + "// new explanation\n__declspec(noinline) int Added() { return 2; }\n", encoding="utf-8")
+        self.commit()
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        name = destination.relative_to(self.root).as_posix()
+        self.assertEqual(check.status[name], "R")
+        self.assertEqual(check.numstat[name], ("2", "0"))
+        self.assertEqual(check.findings, [("comment", name, 15, ""), ("extension", name, 16, "__declspec")])
+
+    def test_copied_code_is_still_checked_as_an_addition(self):
+        source = self.root / "core/tests/Existing.cpp"
+        source.parent.mkdir(parents=True)
+        source.write_text("// existing explanation\n__attribute__((noinline)) int Existing() { return 1; }\n", encoding="utf-8")
+        self.commit()
+        destination = self.root / "core/tests/Copy.cpp"
+        destination.write_bytes(source.read_bytes())
+        self.commit()
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        name = destination.relative_to(self.root).as_posix()
+        self.assertEqual(check.status[name], "A")
+        self.assertEqual(check.findings, [("comment", name, 1, ""), ("extension", name, 2, "__attribute__")])
+
+    def test_moving_a_document_to_a_forbidden_path_is_rejected(self):
+        (self.root / "README.md").rename(self.root / "investigation.md")
+        self.commit()
+        check = Check("HEAD~1", "HEAD")
+        check.repository()
+        self.assertEqual(check.findings, [("notes-file", "investigation.md", 0, "")])
+
+    def test_moving_a_document_rechecks_relative_links(self):
+        source = self.root / "docs/dev/guide.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("[reference](reference.md)\n", encoding="utf-8")
+        (source.parent / "reference.md").write_text("Reference\n", encoding="utf-8")
+        self.commit()
+        destination = self.root / "docs/dev/group/guide.md"
+        destination.parent.mkdir()
+        source.rename(destination)
+        self.commit()
+        check = Check("HEAD~1", "HEAD")
+        check.docs()
+        self.assertEqual(check.findings, [("doc-link", "docs/dev/group/guide.md", 1, "reference.md")])
+
     def test_unicode_raw_literals_keep_git_patch_and_grep_records_intact(self):
         literals = 'R"text(foo\u2028+tail\u2029+tail)text"'
         fixtures = (
@@ -535,6 +720,21 @@ class RepositoryChecksTests(unittest.TestCase):
         check.docs()
         self.assertEqual(check.findings,
                          [("duplicate-export", "core/libs/prx/libSceB/Export.cpp", 1, "sceFooBar is also in libSceA")])
+
+    def test_type_change_does_not_shift_later_files(self):
+        (self.root / "a.txt").write_text("text\n", encoding="utf-8")
+        self.commit()
+        target = self.root / "target"
+        target.write_text("README.md", encoding="utf-8")
+        blob = self.git("hash-object", "-w", "target")
+        target.unlink()
+        self.git("update-index", "--cacheinfo", "120000", blob, "a.txt")
+        (self.root / "z.cpp").write_text("int z;\n// debt\n", encoding="utf-8")
+        self.git("add", "z.cpp")
+        self.git("commit", "-qm", "test: replace a file with a link")
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        self.assertIn(("comment", "z.cpp", 2, ""), check.findings)
 
     def test_submodule_outside_thirdparty_reports_without_crashing(self):
         head = self.git("rev-parse", "HEAD")
@@ -596,4 +796,16 @@ class RepositoryChecksTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--shard":
+        if len(sys.argv) != 3 or "/" not in sys.argv[2]:
+            print("usage: test_check_conventions_comments.py --shard INDEX/COUNT", file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            shard_index, shard_count = (int(part) for part in sys.argv[2].split("/", 1))
+            suite = conventions_test_shard(shard_index, shard_count)
+        except ValueError as error:
+            print(f"invalid shard: {error}", file=sys.stderr)
+            raise SystemExit(2)
+        result = unittest.TextTestRunner().run(suite)
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     unittest.main()

@@ -97,6 +97,10 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         return rva;
     };
 
+    const auto parentVariable = addWideString(u"ANYPS5_LOADEXEC_PARENT");
+    const auto allocatorVariable = addWideString(u"APS5_MIMALLOC");
+    const auto parentText = reserve(34);
+    const auto skipFirstArgument = reserve(4);
     const auto programPath = reserve(PathCapacity * 2);
     const auto modulePath = reserve(PathCapacity * 2);
     const auto argumentBlock = reserve(8);
@@ -115,6 +119,17 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto functionTable = reserve(12 * 32);
     const auto unwindRva = CheckedRva(dataRva + data.size());
     data.insert(data.end(), {1, 10, 6, 0, 10, 0xb2, 6, 0xc0, 4, 0x70, 3, 0x60, 2, 0x50, 1, 0x30});
+
+    std::vector<std::uint32_t> allocatorPaths;
+    std::vector<std::size_t> allocatorUnits;
+    for (const std::string library : {"mimalloc.dll"}) {
+        const auto name = path + library;
+        const auto wideName = toUtf16(name);
+        if (wideName.size() + 1 >= PathCapacity)
+            throw Domain::RelinkerException("Windows library path exceeds the startup buffer: " + name);
+        allocatorPaths.push_back(addWideString(wideName));
+        allocatorUnits.push_back(wideName.size());
+    }
 
     std::vector<std::uint32_t> libraryPaths;
     std::vector<std::size_t> libraryUnits;
@@ -234,6 +249,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
             (import.Library.empty() ? std::string{} : " from " + import.Library) + "\n");
     const auto argumentError = errors.size();
     errors.push_back("FAIL: cannot prepare command-line arguments\n");
+    const auto parentError = errors.size();
+    errors.push_back("FAIL: cannot wait for the previous LoadExec process\n");
     const auto directoryError = errors.size();
     errors.push_back("FAIL: cannot make the executable directory the current directory\n");
     const auto traceError = errors.size();
@@ -396,6 +413,49 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     };
 
     code.Emit({0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x48, 0x83, 0xec, 0x60});
+    code.Rip({0x48, 0x8d, 0x0d}, parentVariable);
+    code.Rip({0x48, 0x8d, 0x15}, parentText);
+    code.Emit({0x41, 0xb8, 17, 0, 0, 0});
+    call("GetEnvironmentVariableW");
+    code.Emit({0x85, 0xc0});
+    const auto noParent = code.Branch({0x0f, 0x84});
+    code.Emit({0x83, 0xf8, 16});
+    const auto shortValue = code.Branch({0x0f, 0x86});
+    fail(parentError, 1);
+    code.PatchBranch(shortValue, code.GetRva());
+    code.Rip({0xc7, 0x05}, skipFirstArgument - 4);
+    code.U32(1);
+    code.Rip({0x48, 0x8d, 0x35}, parentText);
+    code.Emit({0x31, 0xff});
+    const auto digit = code.GetRva();
+    code.Emit({0x0f, 0xb7, 0x06, 0x85, 0xc0});
+    const auto parsed = code.Branch({0x0f, 0x84});
+    code.Emit({0x83, 0xe8, 0x30, 0x83, 0xf8, 9});
+    const auto decimal = code.Branch({0x0f, 0x86});
+    code.Emit({0x83, 0xe8, 0x31, 0x83, 0xf8, 5});
+    const auto hex = code.Branch({0x0f, 0x86});
+    fail(parentError, 1);
+    code.PatchBranch(hex, code.GetRva());
+    code.Emit({0x83, 0xc0, 10});
+    code.PatchBranch(decimal, code.GetRva());
+    code.Emit({0x48, 0xc1, 0xe7, 4, 0x48, 0x09, 0xc7, 0x48, 0x83, 0xc6, 2});
+    code.Rip({0xe9}, digit);
+    code.PatchBranch(parsed, code.GetRva());
+    code.Emit({0x48, 0x89, 0xf9, 0xba, 0xff, 0xff, 0xff, 0xff});
+    call("WaitForSingleObject");
+    code.Emit({0x85, 0xc0});
+    const auto waited = code.Branch({0x0f, 0x84});
+    fail(parentError, 1);
+    code.PatchBranch(waited, code.GetRva());
+    code.Emit({0x48, 0x89, 0xf9});
+    call("CloseHandle");
+    requireNonzero(parentError, 1);
+    code.Rip({0x48, 0x8d, 0x0d}, parentVariable);
+    code.Emit({0x31, 0xd2});
+    call("SetEnvironmentVariableW");
+    requireNonzero(parentError, 1);
+    code.PatchBranch(noParent, code.GetRva());
+
     code.Emit({0x31, 0xc9});
     code.Rip({0x48, 0x8d, 0x15}, programPath);
     code.Emit({0x41, 0xb8});
@@ -430,6 +490,35 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         code.Rip({0x4c, 0x8d, 0x05}, programPath);
         writeUtf8(programText);
     }
+
+    code.Rip({0x48, 0x8d, 0x0d}, allocatorVariable);
+    code.Emit({0x31, 0xd2, 0x45, 0x31, 0xc0});
+    call("GetEnvironmentVariableW");
+    code.Emit({0x85, 0xc0});
+    const auto noAllocator = code.Branch({0x0f, 0x84});
+    for (std::size_t index = 0; index < allocatorPaths.size(); ++index) {
+        std::optional<std::size_t> tooLong;
+        if (absolutePath) {
+            code.Rip({0x48, 0x8d, 0x0d}, allocatorPaths[index]);
+        } else {
+            const auto units = CheckedRva(allocatorUnits[index] + 1);
+            code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
+            code.U32(units * 2);
+            code.Emit({0x48, 0x3d});
+            code.U32(PathCapacity * 2);
+            tooLong = code.Branch({0x0f, 0x87});
+            code.Emit({0x4c, 0x89, 0xe7});
+            code.Rip({0x48, 0x8d, 0x35}, allocatorPaths[index]);
+            code.Emit({0xb9});
+            code.U32(units);
+            code.Emit({0x66, 0xf3, 0xa5});
+            code.Rip({0x48, 0x8d, 0x0d}, modulePath);
+        }
+        code.Emit({0x31, 0xd2, 0x41, 0xb8, 0, 0x11, 0, 0});
+        call("LoadLibraryExW");
+        if (tooLong) code.PatchBranch(*tooLong, code.GetRva());
+    }
+    code.PatchBranch(noAllocator, code.GetRva());
 
     for (std::size_t index = 0; index < libraries.size(); ++index) {
         if (index >= guestModules.size() && !imported[index] && !unscopedImports) continue;
@@ -621,6 +710,13 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     requireNonzero(argumentError, 0xc000000du);
     code.Rip({0x48, 0x89, 0x05}, wideArguments);
     code.Emit({0x48, 0x89, 0xc3});
+    code.Rip({0x83, 0x3d}, skipFirstArgument - 1);
+    code.Emit({0});
+    const auto retainProgramName = code.Branch({0x0f, 0x84});
+    code.Emit({0x48, 0x83, 0xc3, 8});
+    code.Rip({0x83, 0x2d}, argumentCount - 1);
+    code.Emit({1});
+    code.PatchBranch(retainProgramName, code.GetRva());
     code.Rip({0x8b, 0x2d}, argumentCount);
     code.Emit({0x8d, 0x45, 0xff, 0x3d});
     code.U32(ArgumentCapacity - 1);

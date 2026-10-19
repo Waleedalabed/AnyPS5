@@ -4,8 +4,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,7 +40,12 @@ struct HostImport {
     bool joined = false;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
+    std::uint64_t lead = 0;
 };
+
+inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t address) {
+    return address - import.base + import.lead;
+}
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
 
@@ -46,6 +55,9 @@ struct ImportProbe {
     std::uint32_t pages = 0;
     std::uint32_t writtenAtImport = 0;
     std::uint32_t writtenAfterSubmit = 0;
+    std::uint32_t writtenAfterSecondSubmit = 0;
+    std::uint32_t writtenDuringSettle = 0;
+    std::uint32_t writtenAfterSettle = 0;
     std::uint32_t writtenByCpu = 0;
     std::uint32_t writtenAfterFill = 0;
 };
@@ -56,29 +68,62 @@ ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
-// (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
-// the import's buffer.
+// (alignment and budget permitting), or null. Bytes at `address` are at `HostImportOffset(*import,
+// address)` in the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
 void SetHostImportBudget(std::uint64_t bytes);
+void SetHostImportDeferredSettles(bool enabled);
+// The larger of 6 GiB and half the physical memory, at most the largest host heap less the larger of 2 GiB and half
+// that heap: the other half stays for the buffers, mirrors and textures that share it.
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes);
 std::uint64_t HostImportLiveBytes();
+struct HostImportSettleCounts {
+    std::uint64_t submitted = 0;
+    std::uint64_t waited = 0;
+    std::uint64_t rewatched = 0;
+    std::uint64_t parked = 0;
+    std::uint64_t unmapWaits = 0;
+    std::uint64_t keptCompared = 0;
+};
+HostImportSettleCounts HostImportSettles();
+// Tests: how many imports settleImport has used on the settle queue.
+std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+struct RegisteredPiece {
+    std::uint64_t address;
+    std::uint64_t bytes;
+    bool writable;
+    bool gpu;
+};
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
-bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
+bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces = nullptr);
 std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
 class Recorder;
+
+template<typename TRange>
+void OverlappedRanges(std::span<const TRange> sorted, std::size_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::vector<std::size_t>& indices) {
+    indices.clear();
+    for (const auto& [begin, end] : writes) {
+        auto it = std::partition_point(sorted.begin() + static_cast<std::ptrdiff_t>(first), sorted.end(), [&](const TRange& range) { return range.end <= begin; });
+        for (; it != sorted.end() && it->begin < end; ++it) indices.push_back(static_cast<std::size_t>(it - sorted.begin()));
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+}
 
 // Identity of the import serving [address, address + bytes): a serial unique for the life of one
 // import, 0 when no import serves the range. An equal serial later means the same VkBuffer still
@@ -167,6 +212,8 @@ struct MirrorStats {
     std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
+void ClearSnapshotCopies(VkDevice device);
+std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
 void ClearHostImports(VkDevice device);
 
@@ -345,9 +392,10 @@ private:
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
+    void completeSpaceWrites() const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
-    const Region* owner(std::uint64_t address) const;
+    const Region* owner(std::uint64_t address, std::uint64_t end) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {
@@ -392,8 +440,8 @@ private:
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
-    mutable std::uint64_t writeTableSerial = 0;
-    mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> writeTableRanges;
+    mutable std::uint64_t tableSerial = 0;
+    mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> tableRanges;
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
@@ -402,6 +450,7 @@ private:
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
+    bool regionsOverlap = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;

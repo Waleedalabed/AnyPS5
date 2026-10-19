@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -537,6 +538,69 @@ bool Refused(std::uint32_t context, const AjmBatchInfo& info) {
     return false;
 }
 
+void AppendOpusLength(std::vector<std::uint8_t>& out, std::size_t length) {
+    if (length < 252) {
+        out.push_back(static_cast<std::uint8_t>(length));
+        return;
+    }
+    out.push_back(static_cast<std::uint8_t>(252 + (length - 252) % 4));
+    out.push_back(static_cast<std::uint8_t>((length - 252) / 4));
+}
+
+std::vector<std::uint8_t> SelfDelimited(const std::uint8_t* packet, std::size_t bytes) {
+    const std::uint32_t code = packet[0] & 3u;
+    Require(code <= 1);
+    std::vector<std::uint8_t> out{packet[0]};
+    AppendOpusLength(out, code == 0 ? bytes - 1 : (bytes - 1) / 2);
+    out.insert(out.end(), packet + 1, packet + bytes);
+    return out;
+}
+
+void TestOpusMultistreamFamily255(std::uint32_t context) {
+    const bool stereo = (OPUS_STEREO[2] & 0x04u) != 0;
+    const std::uint32_t channels = stereo ? 4 : 2;
+    std::uint32_t mono = 0;
+    std::uint32_t multi = 0;
+    const std::uint32_t parameters[2][3] = {{stereo ? 2u : 1u, 48000, 0}, {channels, 48000, 255}};
+    std::uint32_t* instances[2] = {&mono, &multi};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Require(sceAjmInstanceCreate(context, 24, 0, instances[index]) == 0);
+        std::vector<std::uint8_t> batch(4096);
+        AjmBatchInfo info{};
+        std::int64_t initResult[2] = {-1, -1};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobInitialize(&info, *instances[index], parameters[index], sizeof(parameters[index]), initResult) == 0);
+        Submit(context, info);
+        Require(initResult[0] == 0);
+    }
+    const std::uint32_t streamChannels = channels / 2;
+    std::size_t offset = 0;
+    for (int packet = 0; packet < 3; ++packet) {
+        const std::size_t bytes = OPUS_STEREO[offset] | (std::size_t{OPUS_STEREO[offset + 1]} << 8u);
+        const std::uint8_t* data = OPUS_STEREO + offset + 2;
+        std::vector<std::uint8_t> joined = SelfDelimited(data, bytes);
+        joined.insert(joined.end(), data, data + bytes);
+        std::vector<std::uint8_t> framed{static_cast<std::uint8_t>(joined.size()), static_cast<std::uint8_t>(joined.size() >> 8u)};
+        framed.insert(framed.end(), joined.begin(), joined.end());
+        std::vector<std::int16_t> single(960 * streamChannels, -12345);
+        std::vector<std::int16_t> both(960 * channels, -12345);
+        DecodeSideband sideband{};
+        RunDecode(context, mono, OPUS_STEREO + offset, 2 + bytes, single.data(), single.size() * sizeof(std::int16_t), sideband);
+        Require(sideband.result == 0);
+        RunDecode(context, multi, framed.data(), framed.size(), both.data(), both.size() * sizeof(std::int16_t), sideband);
+        Require(sideband.result == 0 && static_cast<std::size_t>(sideband.inputConsumed) == framed.size() && sideband.outputWritten == 960 * channels * 2);
+        for (std::size_t sample = 0; sample < 960; ++sample) {
+            for (std::uint32_t channel = 0; channel < streamChannels; ++channel) {
+                Require(both[sample * channels + channel] == single[sample * streamChannels + channel]);
+                Require(both[sample * channels + streamChannels + channel] == single[sample * streamChannels + channel]);
+            }
+        }
+        offset += 2 + bytes;
+    }
+    Require(sceAjmInstanceDestroy(context, mono) == 0);
+    Require(sceAjmInstanceDestroy(context, multi) == 0);
+}
+
 void TestOpusMonoFamily255(std::uint32_t context) {
     std::uint32_t instances[2] = {};
     for (std::size_t index = 0; index < 2; ++index) {
@@ -569,7 +633,7 @@ void TestOpusMonoFamily255(std::uint32_t context) {
     }
     Require(peak > 900 && peak < 1200);
 
-    const std::uint32_t refusedParameters[2][3] = {{2, 48000, 255}, {1, 48000, 2}};
+    const std::uint32_t refusedParameters[1][3] = {{1, 48000, 2}};
     for (const auto& parameters : refusedParameters) {
         std::uint32_t instance = 0;
         Require(sceAjmInstanceCreate(context, 24, 0, &instance) == 0);
@@ -1282,6 +1346,66 @@ std::uint32_t CreateOpus(std::uint32_t context) {
     return instance;
 }
 
+void TestInstanceHandleLifetime(std::uint32_t context) {
+    const auto live = CreateOpus(context);
+    const auto reference = CreateOpus(context);
+    const std::size_t packetBytes = 2 + (OPUS_STEREO[0] | (std::size_t{OPUS_STEREO[1]} << 8u));
+    std::vector<std::int16_t> pcm(128 * 2);
+    std::vector<std::int16_t> expected(pcm.size());
+    DecodeSideband decoded{};
+    DecodeSideband baseline{};
+    RunDecode(context, live, OPUS_STEREO, packetBytes, pcm.data(), pcm.size() * sizeof(std::int16_t), decoded);
+    RunDecode(context, reference, OPUS_STEREO, packetBytes, expected.data(), expected.size() * sizeof(std::int16_t), baseline);
+    Require(decoded.result == 0 && decoded.outputWritten == 128 * 2 * 2 && decoded.totalDecodedSamples == 960);
+    Require(baseline.result == 0 && pcm == expected);
+    for (std::size_t index = 0; index < 0x8000; ++index) {
+        std::uint32_t temporary = 0;
+        Require(sceAjmInstanceCreate(context, 24, 0, &temporary) == 0);
+        if (temporary == live || temporary == reference) throw std::runtime_error("AJM creation replaced an existing live decoder handle");
+        Require(temporary >> 14 == 24);
+        Require(sceAjmInstanceDestroy(context, temporary) == 0);
+    }
+    std::vector<bool> occupied(0x4000);
+    occupied[live & 0x3FFF] = true;
+    occupied[reference & 0x3FFF] = true;
+    std::vector<std::uint32_t> instances;
+    instances.reserve(0x4000 - 2);
+    for (std::size_t index = 0; index < 0x4000 - 2; ++index) {
+        std::uint32_t instance = 0;
+        Require(sceAjmInstanceCreate(context, 24, 0, &instance) == 0 && instance >> 14 == 24);
+        Require(!occupied[instance & 0x3FFF]);
+        occupied[instance & 0x3FFF] = true;
+        instances.push_back(instance);
+    }
+    Require(std::all_of(occupied.begin(), occupied.end(), [](bool used) { return used; }));
+    constexpr int outOfResources = static_cast<int>(0x80930007);
+    std::uint32_t refused = 0xDEADBEEF;
+    Require(sceAjmInstanceCreate(context, 24, 0, &refused) == outOfResources && refused == 0xDEADBEEF);
+    std::uint32_t otherCodec = 0;
+    Require(sceAjmInstanceCreate(context, 1, 0, &otherCodec) == 0 && otherCodec >> 14 == 1);
+    const auto released = instances.back();
+    Require(sceAjmInstanceDestroy(context, released) == 0);
+    Require(sceAjmInstanceCreate(context, 24, 0, &instances.back()) == 0 && instances.back() == released);
+    Require(sceAjmInstanceCreate(context, 24, 0, &refused) == outOfResources && refused == 0xDEADBEEF);
+    pcm.assign(832 * 2, -12345);
+    expected.assign(pcm.size(), -12345);
+    RunDecode(context, live, OPUS_STEREO, 0, pcm.data(), pcm.size() * sizeof(std::int16_t), decoded);
+    RunDecode(context, reference, OPUS_STEREO, 0, expected.data(), expected.size() * sizeof(std::int16_t), baseline);
+    Require(decoded.result == 0 && decoded.inputConsumed == 0 && decoded.outputWritten == 832 * 2 * 2 && decoded.totalDecodedSamples == 960);
+    Require(baseline.result == 0 && baseline.outputWritten == decoded.outputWritten && pcm == expected);
+    const std::size_t nextPacketBytes = 2 + (OPUS_STEREO[packetBytes] | (std::size_t{OPUS_STEREO[packetBytes + 1]} << 8u));
+    pcm.assign(960 * 2, -12345);
+    expected.assign(pcm.size(), -12345);
+    RunDecode(context, live, OPUS_STEREO + packetBytes, nextPacketBytes, pcm.data(), pcm.size() * sizeof(std::int16_t), decoded);
+    RunDecode(context, reference, OPUS_STEREO + packetBytes, nextPacketBytes, expected.data(), expected.size() * sizeof(std::int16_t), baseline);
+    Require(decoded.result == 0 && static_cast<std::size_t>(decoded.inputConsumed) == nextPacketBytes && decoded.outputWritten == 960 * 2 * 2 && decoded.totalDecodedSamples == 1920);
+    Require(baseline.result == 0 && baseline.outputWritten == decoded.outputWritten && pcm == expected);
+    for (const auto instance : instances) Require(sceAjmInstanceDestroy(context, instance) == 0);
+    Require(sceAjmInstanceDestroy(context, otherCodec) == 0);
+    Require(sceAjmInstanceDestroy(context, live) == 0);
+    Require(sceAjmInstanceDestroy(context, reference) == 0);
+}
+
 ResampleInfo GetResampleInfo(std::uint32_t context, std::uint32_t instance) {
     ResampleInfo resample;
     std::memset(&resample, 0xAA, sizeof(resample));
@@ -1573,6 +1697,77 @@ void TestAt9RunDecodesWholeInput(std::uint32_t context) {
     Require(sceAjmInstanceDestroy(context, instance) == 0);
 }
 
+void TestOpusGaplessReset(std::uint32_t context, std::size_t outputFrames, float ratio) {
+    const auto instance = CreateOpus(context);
+    const auto reference = CreateOpus(context);
+    std::vector<std::uint8_t> batch(4096);
+    std::vector<std::int16_t> pcm(outputFrames * 2 + 4, -12345);
+    std::vector<std::int16_t> expected(960 * 2);
+    const std::uint32_t totalSamples = ratio > 0 ? 860 : 500;
+    const GaplessDecode gapless{totalSamples, 100, 0};
+    const GaplessDecode unlimited{0, 100, 0};
+    AjmBatchInfo info{};
+    if (ratio > 0) {
+        std::int32_t result[2][2] = {{-1, -1}, {-1, -1}};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobSetResampleParameters(&info, instance, ratio, 1, result[0]) == 0);
+        Require(sceAjmBatchJobSetResampleParameters(&info, reference, ratio, 1, result[1]) == 0);
+        Submit(context, info);
+        Require(result[0][0] == 0 && result[1][0] == 0);
+    }
+    std::size_t offset = 0;
+    for (int segment = 0; segment < 3; ++segment) {
+        std::int32_t result[2][2] = {{-1, -1}, {-1, -1}};
+        GaplessSideband state{-1, -1, 0, 0, 0xffff};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobSetGaplessDecode(&info, instance, &gapless, 1, result[0]) == 0);
+        Require(sceAjmBatchJobSetGaplessDecode(&info, reference, &unlimited, 1, result[1]) == 0);
+        Require(sceAjmBatchJobGetGaplessDecode(&info, instance, &state) == 0);
+        Submit(context, info);
+        Require(result[0][0] == 0 && result[1][0] == 0);
+        Require(state.result == 0 && state.totalSamples == totalSamples && state.skipSamples == 100 && state.skippedSamples == 0);
+        const std::size_t packetBytes = 2 + (OPUS_STEREO[offset] | (std::size_t{OPUS_STEREO[offset + 1]} << 8u));
+        DecodeSideband baseline{};
+        RunDecode(context, reference, OPUS_STEREO + offset, packetBytes, expected.data(), expected.size() * sizeof(std::int16_t), baseline);
+        Require(baseline.result == 0 && static_cast<std::size_t>(baseline.inputConsumed) == packetBytes);
+        Require(baseline.totalDecodedSamples == static_cast<std::uint64_t>(segment + 1) * 860 + (ratio == 0 ? segment * 960 : 0));
+        const std::size_t expectedBytes = ratio > 0 ? static_cast<std::size_t>(baseline.outputWritten) : totalSamples * 2 * sizeof(std::int16_t);
+        Require(expectedBytes > 0);
+        std::size_t produced = 0;
+        for (int drain = 0; produced < expectedBytes && drain < 16; ++drain) {
+            std::fill(pcm.begin(), pcm.end(), -12345);
+            DecodeSideband decoded{};
+            RunDecode(context, instance, OPUS_STEREO + offset, drain == 0 ? packetBytes : 0, pcm.data(), outputFrames * 2 * sizeof(std::int16_t), decoded);
+            if (decoded.outputWritten <= 0) throw std::runtime_error("Opus gapless segment " + std::to_string(segment) + " wrote " + std::to_string(decoded.outputWritten) + " bytes with " + std::to_string(expectedBytes - produced) + " still expected");
+            Require(decoded.result == 0 && static_cast<std::size_t>(decoded.inputConsumed) == (drain == 0 ? packetBytes : 0));
+            Require(decoded.totalDecodedSamples == static_cast<std::uint64_t>(segment + 1) * totalSamples);
+            const auto samples = static_cast<std::size_t>(decoded.outputWritten) / sizeof(std::int16_t);
+            Require(samples <= outputFrames * 2 && produced + static_cast<std::size_t>(decoded.outputWritten) <= expectedBytes);
+            Require(std::equal(pcm.begin(), pcm.begin() + samples, expected.begin() + produced / sizeof(std::int16_t)));
+            Require(std::all_of(pcm.begin() + samples, pcm.end(), [](auto sample) { return sample == -12345; }));
+            produced += static_cast<std::size_t>(decoded.outputWritten);
+        }
+        Require(produced == expectedBytes);
+        if (ratio == 0) {
+            Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+            Require(sceAjmBatchJobSetGaplessDecode(&info, instance, &gapless, 0, result[0]) == 0);
+            Require(sceAjmBatchJobGetGaplessDecode(&info, instance, &state) == 0);
+            Submit(context, info);
+            Require(result[0][0] == 0 && state.result == 0 && state.skippedSamples == 100);
+            std::fill(pcm.begin(), pcm.end(), -12345);
+            DecodeSideband decoded{};
+            RunDecode(context, instance, OPUS_STEREO + offset, packetBytes, pcm.data(), outputFrames * 2 * sizeof(std::int16_t), decoded);
+            RunDecode(context, reference, OPUS_STEREO + offset, packetBytes, expected.data(), expected.size() * sizeof(std::int16_t), baseline);
+            Require(decoded.result == 0 && static_cast<std::size_t>(decoded.inputConsumed) == packetBytes && decoded.outputWritten == 0);
+            Require(decoded.totalDecodedSamples == static_cast<std::uint64_t>(segment + 1) * totalSamples);
+            Require(std::all_of(pcm.begin(), pcm.end(), [](auto sample) { return sample == -12345; }));
+        }
+        offset = (offset + packetBytes) % sizeof(OPUS_STEREO);
+    }
+    Require(sceAjmInstanceDestroy(context, instance) == 0);
+    Require(sceAjmInstanceDestroy(context, reference) == 0);
+}
+
 }
 
 int main() {
@@ -1605,6 +1800,7 @@ int main() {
     TestOpus(context);
     TestOpus(context, 1);
     TestOpusMonoFamily255(context);
+    TestOpusMultistreamFamily255(context);
     TestOpusFamilyZeroChannels(context);
     TestOpusSurround(context, 3, 0);
     for (std::size_t stream = 0; stream < 2; ++stream) {
@@ -1624,11 +1820,15 @@ int main() {
     TestCodecInfo(context);
     TestGetInfo(context);
     TestBatchWaitRelease(context);
+    TestInstanceHandleLifetime(context);
     TestBatchCancel(context);
     TestControlAt9(context);
     TestMultichannelAt9(context);
     TestControlMp3(context);
     TestControlOpus(context);
+    TestOpusGaplessReset(context, 960, 0);
+    TestOpusGaplessReset(context, 128, 0);
+    TestOpusGaplessReset(context, 960, 2.0f);
     std::vector<std::int16_t> delayedAac;
     TestM4aacAdts(context, delayedAac);
     TestM4aacNondelay(context, delayedAac);

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,7 @@ static constexpr int8_t PLAYGO_LOCUS_NOT_DOWNLOADED = 0;
 static constexpr int8_t PLAYGO_LOCUS_LOCAL_SLOW = 2;
 static constexpr int8_t PLAYGO_LOCUS_LOCAL_FAST = 3;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL = ~0ull;
+static constexpr uint64_t PLAYGO_OPTIONAL_CHUNK_MASK_ALL = ~0ull;
 static constexpr int32_t PLAYGO_INSTALL_SPEED_FULL = 2;
 
 static int32_t g_installSpeed = PLAYGO_INSTALL_SPEED_FULL;
@@ -85,9 +87,30 @@ static const ChunkTable& Chunks() {
     return chunks;
 }
 
+enum class UnlistedChunkAnswer { Stop, Installed, Absent };
+
+static UnlistedChunkAnswer UnlistedChunks() {
+    static const UnlistedChunkAnswer answer = [] {
+        const char* text = std::getenv("APS5_PLAYGO_UNLISTED_CHUNKS");
+        if (text == nullptr || text[0] == '\0') return UnlistedChunkAnswer::Stop;
+        const std::string value(text);
+        if (value == "installed") return UnlistedChunkAnswer::Installed;
+        if (value == "absent") return UnlistedChunkAnswer::Absent;
+        throw std::runtime_error("scePlayGo: APS5_PLAYGO_UNLISTED_CHUNKS must be installed or absent, not \"" + value + "\"");
+    }();
+    return answer;
+}
+
 static bool IsKnownChunk(uint16_t id) {
     const auto& chunks = Chunks();
-    return chunks.defined ? chunks.ids.contains(id) : chunks.scenario || id == 0;
+    if (chunks.defined) return chunks.ids.contains(id);
+    if (chunks.scenario || id == 0) return true;
+    switch (UnlistedChunks()) {
+    case UnlistedChunkAnswer::Installed: return true;
+    case UnlistedChunkAnswer::Absent: return false;
+    case UnlistedChunkAnswer::Stop: break;
+    }
+    throw std::runtime_error("scePlayGo: sce_sys/playgo-chunk.dat and sce_sys/playgo-scenario.json are missing, so chunk ID " + std::to_string(id) + " cannot be checked; set APS5_PLAYGO_UNLISTED_CHUNKS=installed or =absent to answer for this dump");
 }
 
 static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries) {
@@ -160,7 +183,7 @@ int APS5_VABI scePlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptional
     if (handle != PLAYGO_HANDLE) return SCE_PLAYGO_ERROR_BAD_HANDLE;
     (void)type;
     if (!option) return SCE_PLAYGO_ERROR_BAD_POINTER;
-    option->bitmask = 0;
+    option->bitmask = PLAYGO_OPTIONAL_CHUNK_MASK_ALL;
     return 0;
 }
 
@@ -177,7 +200,7 @@ int APS5_VABI scePlayGoGetSupportedOptionalChunk(int handle, int32_t type, PlayG
     if (handle != PLAYGO_HANDLE) return SCE_PLAYGO_ERROR_BAD_HANDLE;
     (void)type;
     if (!option) return SCE_PLAYGO_ERROR_BAD_POINTER;
-    option->bitmask = 0;
+    option->bitmask = PLAYGO_OPTIONAL_CHUNK_MASK_ALL;
     return 0;
 }
 

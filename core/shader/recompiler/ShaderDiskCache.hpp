@@ -13,7 +13,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 31;
+inline constexpr std::uint32_t FormatVersion = 40;
 
 enum class LoadStatus {
     Loaded,
@@ -34,6 +34,16 @@ struct Counters {
     std::uint64_t planMisses = 0;
     std::uint64_t planWrites = 0;
     std::uint64_t planLoadFailures = 0;
+    std::uint64_t prebuiltHits = 0;
+    std::uint64_t prebuiltMisses = 0;
+    std::uint64_t prebuiltRejected = 0;
+    std::uint64_t lookupNanoseconds = 0;
+    std::uint64_t readNanoseconds = 0;
+    std::uint64_t decodeNanoseconds = 0;
+    std::uint64_t loadNanoseconds = 0;
+    std::uint64_t maxLoadNanoseconds = 0;
+    std::uint64_t prebuiltBytesRead = 0;
+    std::uint64_t prebuiltLoadNanoseconds = 0;
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
@@ -43,7 +53,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 
 void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
-[[nodiscard]] bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result);
+[[nodiscard]] bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result, std::shared_ptr<const void> owner = nullptr);
 
 [[nodiscard]] std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant, std::shared_ptr<const void> owner = nullptr);
@@ -63,6 +73,8 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
 void Flush();
+void Shutdown();
+[[nodiscard]] unsigned Writers();
 [[nodiscard]] Counters Totals();
 
 }

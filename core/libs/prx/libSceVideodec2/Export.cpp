@@ -267,12 +267,20 @@ std::vector<Vp9Unit> ParseVp9Packet(std::span<const std::uint8_t> bytes, std::ar
     return result;
 }
 
+struct Crop {
+    std::uint32_t left = 0;
+    std::uint32_t right = 0;
+    std::uint32_t top = 0;
+    std::uint32_t bottom = 0;
+};
+
 struct Picture {
     std::uint64_t pts = 0;
     std::uint64_t dts = 0;
     std::uint64_t attached = 0;
     bool idr = false;
     Vp9PictureInfo vp9{};
+    Crop crop{};
 };
 
 struct FrameDeleter {
@@ -295,6 +303,7 @@ struct Decoder {
     std::int64_t nextKey = 0;
     std::deque<FramePointer> ready;
     std::vector<std::uint8_t> annexB;
+    std::vector<std::uint8_t> parameterSets;
     bool flushing = false;
     std::array<Vp9PictureInfo, 8> vp9References{};
     Vp9PictureInfo vp9Colors{};
@@ -356,6 +365,7 @@ void OpenCodec(Decoder& decoder) {
     decoder.context->err_recognition = AV_EF_EXPLODE;
     decoder.context->thread_count = 0;
     decoder.context->thread_type = FF_THREAD_SLICE;
+    decoder.context->apply_cropping = 0;
     if (avcodec_open2(decoder.context, codec, nullptr) < 0) {
         avcodec_free_context(&decoder.context);
         throw std::runtime_error("Videodec2: cannot open decoder");
@@ -378,6 +388,16 @@ const std::vector<std::uint8_t>* ToAnnexB(Decoder& decoder, const std::uint8_t* 
         index += 4 + length;
     }
     return &decoder.annexB;
+}
+
+bool CarriesAvcSlice(const std::vector<std::uint8_t>& unit) {
+    for (std::size_t index = 0; index + 3 < unit.size(); ++index) {
+        if (unit[index] != 0 || unit[index + 1] != 0 || unit[index + 2] != 1) continue;
+        const auto type = unit[index + 3] & 0x1fu;
+        if (type >= 1 && type <= 5) return true;
+        index += 2;
+    }
+    return false;
 }
 
 void Receive(Decoder& decoder) {
@@ -443,6 +463,7 @@ void EmitDecoded(std::uint64_t handle, Decoder& decoder, FrameBuffer* frame, Out
     auto timestamps = found->second;
     decoder.inputs.erase(found);
     timestamps.idr = (picture->flags & AV_FRAME_FLAG_KEY) != 0;
+    timestamps.crop = {static_cast<std::uint32_t>(picture->crop_left), static_cast<std::uint32_t>(picture->crop_right), static_cast<std::uint32_t>(picture->crop_top), static_cast<std::uint32_t>(picture->crop_bottom)};
     decoder.width = static_cast<std::uint32_t>(picture->width);
     decoder.height = static_cast<std::uint32_t>(picture->height);
     if (decoder.context->profile > 0) decoder.profile = static_cast<std::uint32_t>(decoder.context->profile) & 0xffu;
@@ -534,7 +555,10 @@ int APS5_VABI sceVideodec2Decode_nid_postfix(std::uint64_t handle, const InputDa
     if (Trace() && decoder.decoded < 3) std::fprintf(stderr, "[videodec2] Decode input=%llu frame=%llu output=%llu au=%llu pts=%llu size=%ux%u fb=%p/%llu\n", static_cast<unsigned long long>(input->thisSize), static_cast<unsigned long long>(frame ? frame->thisSize : 0), static_cast<unsigned long long>(output->thisSize), static_cast<unsigned long long>(input->auSize), static_cast<unsigned long long>(input->ptsData), decoder.width, decoder.height, frame ? frame->frameBuffer : nullptr, static_cast<unsigned long long>(frame ? frame->frameBufferSize : 0));
     ++decoder.decoded;
     const Picture picture{input->ptsData, input->dtsData, input->attachedData};
-    if (decoder.flushing) throw std::runtime_error("Videodec2: reset required after flushing");
+    if (decoder.flushing) {
+        avcodec_flush_buffers(decoder.context);
+        decoder.flushing = false;
+    }
     if (!input->auData || input->auSize == 0 || input->auSize > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) throw std::runtime_error("Videodec2: invalid access unit");
     if (decoder.codec == CodecVp9) {
         auto references = decoder.vp9References;
@@ -564,12 +588,20 @@ int APS5_VABI sceVideodec2Decode_nid_postfix(std::uint64_t handle, const InputDa
         return 0;
     }
     const auto* unit = ToAnnexB(decoder, input->auData, static_cast<std::size_t>(input->auSize));
+    if (decoder.codec == CodecAvc && !CarriesAvcSlice(*unit)) {
+        decoder.parameterSets.insert(decoder.parameterSets.end(), unit->begin(), unit->end());
+        EmitDecoded(handle, decoder, frame, output);
+        return 0;
+    }
     AVPacket* packet = av_packet_alloc();
     if (!packet) throw std::runtime_error("Videodec2: cannot allocate packet");
     const auto freePacket = [](AVPacket* value) { av_packet_free(&value); };
     const std::unique_ptr<AVPacket, decltype(freePacket)> packetOwner(packet, freePacket);
-    if (av_new_packet(packet, static_cast<int>(unit->size())) < 0) throw std::runtime_error("Videodec2: cannot allocate packet data");
-    std::memcpy(packet->data, unit->data(), unit->size());
+    if (decoder.parameterSets.size() + unit->size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) throw std::runtime_error("Videodec2: invalid access unit");
+    if (av_new_packet(packet, static_cast<int>(decoder.parameterSets.size() + unit->size())) < 0) throw std::runtime_error("Videodec2: cannot allocate packet data");
+    std::memcpy(packet->data, decoder.parameterSets.data(), decoder.parameterSets.size());
+    std::memcpy(packet->data + decoder.parameterSets.size(), unit->data(), unit->size());
+    decoder.parameterSets.clear();
     packet->pts = decoder.nextKey;
     decoder.inputs.emplace(decoder.nextKey++, picture);
     Send(decoder, packet);
@@ -606,6 +638,7 @@ int APS5_VABI sceVideodec2Reset_nid_postfix(std::uint64_t handle) {
     avcodec_flush_buffers(decoder.context);
     decoder.ready.clear();
     decoder.inputs.clear();
+    decoder.parameterSets.clear();
     decoder.flushing = false;
     return 0;
 }
@@ -672,6 +705,17 @@ int APS5_VABI sceVideodec2GetVp9PictureInfo_nid_postfix(const OutputInfo* output
     }
     info->isValid = false;
     return 0;
+}
+
+void Videodec2PictureCrop_nid_no_patch(std::uint64_t handle, const void* frameBuffer, Crop* crop) {
+    if (!crop) throw std::runtime_error("Videodec2: invalid argument pointer");
+    const auto found = FindDecoder(handle);
+    if (!found) throw std::runtime_error("Videodec2: invalid decoder handle");
+    auto& decoder = *found;
+    std::lock_guard guard(decoder.mutex);
+    const auto picture = decoder.pictures.find(frameBuffer);
+    if (picture == decoder.pictures.end()) throw std::runtime_error("Videodec2: unknown frame buffer");
+    *crop = picture->second.crop;
 }
 
 }

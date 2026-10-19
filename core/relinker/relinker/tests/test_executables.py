@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,9 @@ def main():
             assert sorted(path.name for path in output.parent.rglob("*.guest.prx")) == ["bundled.prx.guest.prx"]
             if not windows:
                 assert "$ORIGIN/app0/sce_module/bundled.prx.guest.prx" in needed_libraries(secondary.read_bytes())
+                if os.name != "nt":
+                    for executable in (output, secondary):
+                        assert stat.S_IMODE(executable.stat().st_mode) & 0o111 == 0o111, (executable, oct(executable.stat().st_mode))
             if windows and os.name == "nt":
                 for executable in (output, secondary):
                     run = subprocess.run([str(executable)], capture_output=True, text=True, timeout=30)
@@ -58,6 +62,23 @@ def main():
                 result, output = convert(case, windows, options)
                 assert result.returncode == 2 and message in result.stderr, (options, result.stderr)
                 assert not output.exists(), options
+
+            for index, (directory, executable) in enumerate((("Picker", "picker/picker.bin"), ("picker", "PICKER/picker.bin"), ("linked", "picker/picker.bin"))):
+                case = work / f"{windows}-identity-{index}"
+                case.mkdir()
+                insensitive = (work / f"{windows}-IDENTITY-{index}").exists()
+                if (directory == "linked" and os.name == "nt") or (executable != "picker/picker.bin" and not insensitive):
+                    continue
+                if directory == "linked":
+                    (case / "linked").symlink_to("picker", target_is_directory=True)
+                elif not insensitive:
+                    (case / directory).mkdir()
+                result, output = convert(case, windows, ["--module-dir", directory, "--executable", executable])
+                if insensitive or directory == "linked":
+                    assert result.returncode == 2 and "in a guest module directory" in result.stderr, (directory, executable, result.stderr)
+                    assert not output.exists(), (directory, executable)
+                else:
+                    assert result.returncode == 0, (directory, executable, result.stdout, result.stderr)
 
             case = work / f"{windows}-needed"
             (case / "Media" / "Modules").mkdir(parents=True)
@@ -84,6 +105,13 @@ def main():
                     assert needed_libraries(modules[0].read_bytes()) == [], needed_libraries(modules[0].read_bytes())
                     assert "libSceVideoOut.prx" in needed_libraries(output.read_bytes())
                     assert "libScePad.prx" in needed_libraries(secondary.read_bytes())
+
+        if os.name != "nt":
+            result, output = convert(work / "macos-picker", False, ["--macos", "--executable", "picker/picker.bin"])
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            for executable in (output, output.parent / "picker.picker.bin.elf"):
+                assert executable.read_bytes().startswith(bytes.fromhex("cffaedfe")), executable
+                assert stat.S_IMODE(executable.stat().st_mode) & 0o111 == 0o111, (executable, oct(executable.stat().st_mode))
 
 
 if __name__ == "__main__":

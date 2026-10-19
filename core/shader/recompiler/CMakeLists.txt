@@ -35,7 +35,9 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/StencilReplay.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCachePack.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaOpcode.cpp
@@ -119,6 +121,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtInstructionPredicates.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtPlanBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtRuntimeValidator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtTape.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtWalker.cpp
 
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvModule.cpp
@@ -166,15 +169,21 @@ function(add_shader_recompiler target runtimeTarget)
 
     target_compile_features(${target} PUBLIC cxx_std_20)
 
+    if(ANYPS5_ENABLE_SPIRV_TOOLS)
+        target_sources(${target} PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvOptimizer.cpp)
+    endif()
+
     set(shaderCacheGeneratedDir "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated")
-    set(shaderCacheVersionHeader "${shaderCacheGeneratedDir}/ShaderCacheVersion.hpp")
+    set(shaderCacheVersionSource "${shaderCacheGeneratedDir}/ShaderCacheVersion.cpp")
     file(GLOB_RECURSE shaderCacheRecompilerSources CONFIGURE_DEPENDS
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.cpp"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.hpp"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.h"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.cmake"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CMakeLists.txt"
     )
+    get_target_property(shaderCacheCompiledSources ${target} SOURCES)
+    list(APPEND shaderCacheRecompilerSources ${shaderCacheCompiledSources})
+    list(REMOVE_DUPLICATES shaderCacheRecompilerSources)
     set(shaderCacheKeySources "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostThreadLocal.hpp")
     foreach(source IN LISTS shaderCacheKeySources)
         if(NOT EXISTS "${source}")
@@ -218,13 +227,18 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
+            BuildBarycentricTessellationShaders
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            ImageTableAbi::PoisonCode
+            ImageTableAbi::PoisonReasonName
+            ImageTableAbi::TableHeader
             PixelInput
             PixelInputBit
             RayTracingStrict
@@ -241,21 +255,37 @@ function(add_shader_recompiler target runtimeTarget)
             MaterializeShader
             RegistrationResult
             ResolveSource
+            ResourceMaterializer::EvaluateNanoseconds
+            ResourceMaterializer::MaterializeNanoseconds
+            ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
+            SampledTextureNumericClass
             SetDebugProbeActive
             ShaderCacheDirectory
+            ShaderDiskCache::Shutdown
+            ShaderStage
+            HashSpirvWords
+            ShaderDiskCache::DecodeResult
+            ShaderDiskCache::Enabled
+            ShaderDiskCache::EncodeResult
+            ShaderDiskCache::EntryDirectory
+            ShaderDiskCache::SourceVersion
             SrgbDecodeBit
             SrgbUnormFormat
             FindUserDataTail
             LinkUserDataTail
             ThreadOwned
+            ProgramRole
             UnresolvableSwappcTarget
             ValidateAndOptimizeSpirv
             FindUserDataCalls
             UserDataCalleeLength
             LinkUserDataCalls
+            FindTableCalls
+            LinkCalls
+            LoadStamp
             WriteFileAtomically
     )
     set(shaderCacheManifest)
@@ -278,21 +308,20 @@ function(add_shader_recompiler target runtimeTarget)
     set(shaderCacheListFile "${shaderCacheGeneratedDir}/sources.txt")
     file(CONFIGURE OUTPUT "${shaderCacheListFile}" CONTENT "${shaderCacheManifest}" @ONLY)
     add_custom_command(
-            OUTPUT "${shaderCacheVersionHeader}"
+            OUTPUT "${shaderCacheVersionSource}"
             COMMAND ${CMAKE_COMMAND}
             "-DROOT=${PROJECT_SOURCE_DIR}"
             "-DLIST_FILE=${shaderCacheListFile}"
             "-DRECOMPILER_DIR=${CMAKE_CURRENT_FUNCTION_LIST_DIR}"
             "-DGIT=${GIT_EXECUTABLE}"
             "-DEXTRA=${shaderCacheExtra}"
-            "-DOUTPUT=${shaderCacheVersionHeader}"
+            "-DOUTPUT=${shaderCacheVersionSource}"
             -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"
             DEPENDS ${shaderCacheRecompilerSources} ${shaderCacheGuardSources} ${shaderCacheSubmoduleStamps} "${shaderCacheListFile}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"
             COMMENT "Hashing the shader recompiler sources for the shader disk cache"
             VERBATIM
     )
-    target_sources(${target} PRIVATE "${shaderCacheVersionHeader}")
-    target_include_directories(${target} PRIVATE "${shaderCacheGeneratedDir}")
+    target_sources(${target} PRIVATE "${shaderCacheVersionSource}")
 
     set_target_properties(${target} PROPERTIES
             POSITION_INDEPENDENT_CODE ON
@@ -306,8 +335,15 @@ function(add_shader_recompiler target runtimeTarget)
     )
 
     if(ANYPS5_ENABLE_SPIRV_TOOLS)
-        target_sources(${target} PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvOptimizer.cpp)
         target_link_libraries(${target} PRIVATE SPIRV-Tools-opt SPIRV-Tools-static)
     endif()
     target_compile_definitions(${target} PUBLIC ANYPS5_ENABLE_SPIRV_TOOLS=$<BOOL:${ANYPS5_ENABLE_SPIRV_TOOLS}>)
+    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET spirv_validator_exit_tests)
+        add_test_executable(spirv_validator_exit_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/SpirvValidatorExit.cpp")
+        target_link_libraries(spirv_validator_exit_tests PRIVATE SPIRV-Tools-static)
+        set_target_properties(spirv_validator_exit_tests PROPERTIES CXX_EXTENSIONS OFF)
+        configure_windows_unwind(spirv_validator_exit_tests)
+        add_test(NAME spirv_validator_exit COMMAND spirv_validator_exit_tests)
+        set_tests_properties(spirv_validator_exit PROPERTIES TIMEOUT 30)
+    endif()
 endfunction()

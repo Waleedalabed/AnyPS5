@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -73,6 +74,10 @@ inline void Check(VkResult result, const char* operation) {
 inline void Require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC graphics: ") + reason);
 }
+
+struct DescriptorRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
 // loader's vkGetDeviceProcAddr is a name lookup under its global mutex per call, paid at every
@@ -162,7 +167,12 @@ struct Context {
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex* sparseQueueMutex = nullptr;
+    VkQueue settleQueue = VK_NULL_HANDLE;
+    VkCommandPool settlePool = VK_NULL_HANDLE;
+    std::uint32_t settleFamily = 0;
+    std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
@@ -183,6 +193,7 @@ struct Context {
     bool dualSrcBlend = false;
     bool samplerFilterMinmax = false;
     bool nonSeamlessCubeMap = false;
+    VkSampleCountFlags mergedCoverageSampleCounts = 0;
     bool conservativeRasterization = false;
     bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
@@ -197,26 +208,37 @@ struct Context {
     bool descriptorIndexing = false;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingLimits{};
     bool imageInt64Atomics = false;
+    bool runtimeDescriptorArray = false;
+    bool partiallyBound = false;
+    bool variableDescriptorCount = false;
+    std::uint32_t imageTableCapacity = 0;
+    std::uint32_t samplerTableCapacity = 0;
+    bool individuallyFreeDescriptorSets = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool storageImageMultisample = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
     bool viewportIndexLayer = false;
+    bool demoteToHelperInvocation = false;
+    bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
+    std::uint32_t srgbCopyFormats = 0;
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+    bool shaderTerminateInvocation = false;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
@@ -284,15 +306,25 @@ struct Context {
         const auto budget = reported.heapBudget[heap];
         const auto usage = reported.heapUsage[heap];
         if (budget == 0 || (usage < budget && bytes <= budget - usage)) return type;
+        const auto host = HostMemoryType(mask);
+        if (!host) return type;
+        static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+        const auto count = placements.fetch_add(1) + 1;
+        const auto total = placedBytes.fetch_add(bytes) + bytes;
+        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), *host, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+        return *host;
+    }
+
+    std::optional<std::uint32_t> HostMemoryType(std::uint32_t mask) const {
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-            if ((mask & (1u << i)) == 0 || (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
-            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
-            const auto count = placements.fetch_add(1) + 1;
-            const auto total = placedBytes.fetch_add(bytes) + bytes;
-            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
-            return i;
+            if ((mask & (1u << i)) != 0 && (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return i;
         }
-        return type;
+        return std::nullopt;
+    }
+
+    std::optional<std::uint32_t> RefusedDeviceMemoryFallback(std::uint32_t mask, std::uint32_t refused) const {
+        if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
+        return HostMemoryType(mask);
     }
 };
 
@@ -300,6 +332,10 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
+
+std::uint32_t ImageTableCapacity(const Context& context);
+std::uint32_t StorageTableCapacity(const Context& context);
+std::uint32_t SamplerTableCapacity(const Context& context);
 
 }
 

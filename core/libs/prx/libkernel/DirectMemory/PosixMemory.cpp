@@ -3,6 +3,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include <algorithm>
 #include <limits>
@@ -17,8 +18,10 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI sceKernelMunmap(std::uint64_t address, std::size_t length);
 extern "C" int APS5_VABI sceKernelMlock_nid_postfix(void* address, std::uint64_t length);
 extern "C" int APS5_VABI sceKernelMunlock_nid_postfix(void* address, std::uint64_t length);
+extern "C" int APS5_VABI sceKernelMunlockall_nid_postfix();
 extern "C" int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info, uint64_t info_size);
 
 namespace {
@@ -108,15 +111,18 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         if (descriptor != -1 || offset != 0) return failed(GuestInvalid);
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (fixedAnonymous && ((start & (PS5_PAGE_SIZE - 1)) != 0 ||
-            rounded > std::numeric_limits<std::uintptr_t>::max() - start ||
-            !GuestArena::GuestArenaContains_nid_postfix(address, rounded))) return failed(GuestInvalid);
+            rounded > std::numeric_limits<std::uintptr_t>::max() - start)) return failed(GuestInvalid);
+#ifndef _WIN32
+        if (fixedAnonymous && !GuestArena::GuestArenaContains_nid_postfix(address, rounded)) return failed(GuestInvalid);
+#endif
         const bool exclusive = fixedAnonymous && (mappingFlags & GuestMapExclusive) != 0;
         const int placement = fixedAnonymous ? GuestMapFixed | (exclusive ? GuestMapNoOverwrite : 0) : 0;
         void* mapped = fixedAnonymous ? address : nullptr;
         const auto alignment = !fixedAnonymous && (flags & GuestAlignedSuper) != 0 ? SuperpageSize : PS5_PAGE_SIZE;
         try {
-            const auto result = DoMapAnon(&mapped, rounded, protection, placement, alignment, exclusive);
-            if (result != 0) return failed(GuestNoMemory);
+            const auto result = DoMapAnon(&mapped, rounded, protection, placement, alignment, exclusive, fixedAnonymous);
+            if (result != 0) return failed(result == SCE_KERNEL_ERROR_EINVAL ? GuestInvalid : GuestNoMemory);
+            if (fixedAnonymous) ReleaseFlexibleMappingRange(start, rounded);
             return mapped;
         } catch (const std::invalid_argument&) {
             return failed(fixedAnonymous ? GuestInvalid : GuestNoMemory);
@@ -133,6 +139,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         (mappingFlags & ~(GuestShared | GuestPrivate | GuestMapFixed | GuestMapNoOverwrite | GuestMapNoCoalesce)) != 0)
         return failed(GuestNotSupported);
     if (descriptor < 0) return failed(GuestBadDescriptor);
+    File::RefuseArchivedFile(descriptor, "mmap");
     if (offset < 0 || (static_cast<std::uint64_t>(offset) & (PS5_PAGE_SIZE - 1)) != 0 ||
         rounded > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
         static_cast<std::uint64_t>(offset) > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - rounded)
@@ -157,6 +164,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         mapped = address;
         const auto result = DoMapFileBacked_nid_no_patch(&mapped, rounded, protection, kind | placement, mappingDescriptor, static_cast<std::uint64_t>(offset), alignment);
         if (result != 0) return failed(result == SCE_KERNEL_ERROR_EINVAL ? GuestInvalid : GuestNoMemory);
+        if ((placement & GuestMapFixed) != 0) ReleaseFlexibleMappingRange(reinterpret_cast<std::uintptr_t>(mapped), rounded);
         return mapped;
     } catch (const std::invalid_argument&) {
         return failed(GuestInvalid);
@@ -185,7 +193,7 @@ int APS5_VABI munmap_nid_postfix(void* address, std::size_t length) noexcept {
         rounded > std::numeric_limits<std::uintptr_t>::max() - start)
         return failed(GuestInvalid);
     try {
-        if (DoMunmap(address, rounded) != 0) return failed(GuestInvalid);
+        if (sceKernelMunmap(start, rounded) != 0) return failed(GuestInvalid);
         return 0;
     } catch (const std::bad_alloc&) {
         return failed(GuestNoMemory);
@@ -238,6 +246,13 @@ int APS5_VABI mlockall_nid_postfix(int flags) {
     }
     if ((flags & GuestLockFuture) != 0) throw std::runtime_error("mlockall: MCL_FUTURE is not implemented: later mappings are not locked");
     throw std::runtime_error("mlockall: MCL_CURRENT is not implemented: the process also holds host stacks, heaps, modules and driver mappings");
+}
+
+int APS5_VABI munlockall_nid_postfix() {
+    const int result = sceKernelMunlockall_nid_postfix();
+    if (result == 0) return 0;
+    SetError(result & 0xffff);
+    return -1;
 }
 
 int APS5_VABI msync_nid_postfix(void* address, std::size_t length, int flags) {

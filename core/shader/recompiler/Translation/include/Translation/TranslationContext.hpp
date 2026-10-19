@@ -27,6 +27,7 @@ public:
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
+    void TranslateUnlinkedCall(const RdnaInstruction& instruction);
 
 private:
     struct AddressOperands {
@@ -60,6 +61,7 @@ private:
     bool outputModifierApplies(std::uint32_t denormalShift) const;
     bool dx10Clamp() const { return !floatMode.has_value() || floatMode->dx10Clamp; }
     bool fp16Overflow() const { return floatMode.has_value() && floatMode->fp16Overflow; }
+    bool nativeFloat16Mode() const { return nativeFloat16 && (!floatMode.has_value() || (floatMode->floatMode & 0xccu) == 0xc0u); }
     IrF32 clampF16Overflow(IrF32 value, std::initializer_list<IrValue*> sources);
     void rejectHalfOrDoubleOutputModifier(const RdnaOperand& operand) const;
     IrU32 clampF16Bits(const RdnaOperand& operand, IrU32 bits);
@@ -72,7 +74,9 @@ private:
     IrU32 flushF16Input(IrU32 bits);
     IrU32 flushF16Result(IrU32 bits);
     IrF32 flushF16InputValue(IrF32 value);
+    IrF32 flushTinyF16Value(IrF32 value, std::uint32_t threshold);
     IrU32 convertF32ToF16Bits(IrF32 value, std::initializer_list<IrValue*> sources);
+    IrU32 flushTinyF16Conversion(IrF32 value, IrU32 bits);
     void writeF16Conversion(const RdnaOperand& operand, IrF32 value, std::initializer_list<IrValue*> sources);
     IrU32 readU32(const RdnaOperand& operand);
     IrU32 flushF32Denormal(IrU32 bits);
@@ -152,6 +156,7 @@ private:
     bool dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue);
     bool dsCondxchg32(const RdnaInstruction& inst);
     bool dsAppendConsume(const RdnaInstruction& inst, IrOpcode opcode);
+    bool dsOrderedCount(const RdnaInstruction& inst);
     bool dsAddtid(const RdnaInstruction& inst, bool write);
     bool globalAddtid(const RdnaInstruction& inst, bool write);
     bool dsSwizzleB32(const RdnaInstruction& inst);
@@ -204,6 +209,7 @@ private:
     bool vDivFixupF16(const RdnaInstruction& inst);
     bool float16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
     bool float16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix);
+    bool float16Native(const RdnaInstruction& inst, IrOpcode opcode, const RdnaOperand& lhsOperand, const RdnaOperand& rhsOperand);
     IrF32 fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend);
     bool floatUnary(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatBinary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
@@ -245,6 +251,9 @@ private:
     bool floatCube(const RdnaInstruction& inst, std::uint32_t resultKind);
     bool integer16Shift(const RdnaInstruction& inst, IrOpcode opcode, bool arithmetic);
     bool integer16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    IrU32 readU16Factor(const RdnaOperand& operand, bool highHalf, bool negate);
+    bool vMulLoU16(const RdnaInstruction& inst);
+    bool vPkMulLoU16(const RdnaInstruction& inst);
     bool integer16Mad(const RdnaInstruction& inst, bool sign, bool wide);
     IrU32 saturateU16Result(const RdnaInstruction& inst, const IrU32& value, bool sign);
     IrU32 wideAdd(const RdnaInstruction& inst, const IrU32& low, const IrU32& high, const IrU32& addend, bool sign);

@@ -51,7 +51,7 @@ FiberStorage g_secondStorage;
 auto* const g_first = reinterpret_cast<FiberObject*>(&g_firstStorage);
 auto* const g_second = reinterpret_cast<FiberObject*>(&g_secondStorage);
 
-void CheckActiveContext(FiberObject* fiber, std::uint64_t expectedSize) {
+[[gnu::no_sanitize("address")]] void CheckActiveContext(FiberObject* fiber, std::uint64_t expectedSize) {
     FiberInfo info{};
     info.size = sizeof(info);
     Require(sceFiberGetInfo(fiber, &info) == 0, "active fiber context info");
@@ -172,6 +172,29 @@ void APS5_VABI HostCallEntry(std::uint64_t, std::uint64_t) {
     for (;;) sceFiberReturnToThread(0, &received);
 }
 
+alignas(16) std::array<unsigned char, 64 * 1024> g_chainContext;
+FiberStorage g_chainStorage;
+bool g_chainEnded = false;
+
+void APS5_VABI FrameChainEntry(std::uint64_t, std::uint64_t) {
+    auto* frame = static_cast<std::uintptr_t*>(__builtin_frame_address(0));
+    const auto low = reinterpret_cast<std::uintptr_t>(frame);
+    const auto high = low + (1u << 20);
+    for (int depth = 0; depth < 100; ++depth) {
+        const auto address = reinterpret_cast<std::uintptr_t>(frame);
+        Require(address >= low && address + 2 * sizeof(std::uintptr_t) <= high, "frame chain stays on the fiber's stack");
+        if (frame[1] == 0) {
+            g_chainEnded = frame[0] == 0;
+            break;
+        }
+        auto* next = reinterpret_cast<std::uintptr_t*>(frame[0]);
+        Require(reinterpret_cast<std::uintptr_t>(next) > address, "frame chain climbs the stack to a frame whose return address is 0");
+        frame = next;
+    }
+    std::uint64_t received = 0;
+    for (;;) sceFiberReturnToThread(0, &received);
+}
+
 void RunHostCallOnSmallContext() {
     auto* fiber = reinterpret_cast<FiberObject*>(&g_hostCallStorage);
     auto* context = g_hostCallArea.data() + g_hostCallArea.size() - HostCallContextSize;
@@ -182,6 +205,34 @@ void RunHostCallOnSmallContext() {
     for (auto* byte = g_hostCallArea.data(); byte != context; ++byte) {
         Require(*byte == HostCallGuardFill, "a host call from a 16 KiB fiber writes nothing below its context");
     }
+}
+
+void RunFrameChain() {
+    auto* fiber = reinterpret_cast<FiberObject*>(&g_chainStorage);
+    Require(_sceFiberInitializeImpl_nid_postfix(fiber, "chain", FrameChainEntry, 0, g_chainContext.data(), g_chainContext.size(), nullptr, 0) == 0, "initialize chain");
+    Require(sceFiberRun_nid_postfix(fiber, 0, nullptr) == 0, "run chain");
+    Require(g_chainEnded, "frame chain of a fiber ends at a frame whose saved frame pointer and return address are 0");
+    Require(sceFiberFinalize(fiber) == 0, "finalize chain");
+}
+
+constexpr std::size_t LargeContextSize = 512 * 1024;
+alignas(16) std::array<unsigned char, LargeContextSize> g_largeContext;
+FiberStorage g_largeStorage;
+bool g_largeOnContext = false;
+
+void APS5_VABI LargeContextEntry(std::uint64_t, std::uint64_t) {
+    volatile unsigned char local = 0;
+    const auto* address = const_cast<const unsigned char*>(&local);
+    g_largeOnContext = address >= g_largeContext.data() && address < g_largeContext.data() + g_largeContext.size();
+    sceFiberReturnToThread(0, nullptr);
+}
+
+void RunOnLargeContext() {
+    auto* fiber = reinterpret_cast<FiberObject*>(&g_largeStorage);
+    Require(_sceFiberInitializeImpl_nid_postfix(fiber, "large", LargeContextEntry, 0, g_largeContext.data(), g_largeContext.size(), nullptr, 0) == 0, "initialize large fiber");
+    Require(sceFiberRun_nid_postfix(fiber, 0, nullptr) == 0, "run large fiber");
+    Require(g_largeOnContext, "a fiber with a 512 KiB context runs on its context");
+    Require(sceFiberFinalize(fiber) == 0, "finalize large fiber");
 }
 
 [[gnu::noinline]] std::int32_t RunFirst(std::uint64_t* returned) {
@@ -231,4 +282,6 @@ int main() {
     Require(sceFiberStopContextSizeCheck() == 0, "stop size check");
 
     RunHostCallOnSmallContext();
+    RunFrameChain();
+    RunOnLargeContext();
 }
