@@ -16,6 +16,8 @@ void ShareDescriptor(int from, int to);
 void ForgetDescriptor(int fd);
 bool Appends(int fd);
 bool IsVnode(int fd);
+bool LastDescriptorOfOpenFile(int fd);
+bool OpenFileWrites(int fd);
 
 }
 
