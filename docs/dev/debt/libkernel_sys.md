@@ -3,6 +3,10 @@
 ### Silent stubs
 - [fchmodat](../../../core/libs/prx/libkernel_sys/Export.cpp) (libkernel_sys) - `AT_SYMLINK_NOFOLLOW` on a symbolic link (on Windows and Linux)
 
+### Unknown function info
+
+- [fstat, pwrite, scePthreadBarrierInit, scePthreadBarrierWait, scePthreadBarrierDestroy, the scePthreadBarrierattr functions, scePthreadGetcpuclockid, sceKernelFlock, sceKernelMlockall and sceKernelMsync](../../../core/libs/prx/libkernel_sys/Export.Discovery.cpp) (libkernel_sys) - forward to libkernel's `_fstat`, `pwrite` and POSIX barrier and `pthread_getcpuclockid` implementations, as FreeBSD's libc aliases `fstat` to `_fstat`; the `scePthread` forms return a positive POSIX error as `0x8002xxxx`, the `sceKernel` forms turn -1 and `errno` into `0x8002xxxx`, keep `PTHREAD_BARRIER_SERIAL_THREAD` (-1) from the barrier wait and ignore the barrier name, following [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/0ebea15c24253b60f514fc37a348dabc8d0bcb90/src/core/libraries/kernel/threads/barrier.cpp). The PS5 exports them from libkernel_sys rather than libkernel; that they behave as the libkernel functions do is assumed, not measured
+
 ### Functional
 
 - [fchdir](../../../core/libs/prx/libkernel_sys/Export.cpp) (libkernel_sys) changes the guest working directory to the descriptor's directory: on Windows through the path recorded when the descriptor was opened, on Linux through the `/proc/self/fd` link target. It returns `EBADF` for a descriptor that is not open and `ENOTDIR` for one that is not a directory. Outside Windows it checks search permission on the directory with `faccessat`, which fails with `EACCES` as FreeBSD `change_dir` does; on Windows that check is not modelled. A directory renamed after it was opened is still reached through the recorded path. Console behaviour is unverified

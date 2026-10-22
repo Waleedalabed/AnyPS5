@@ -1,5 +1,38 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
+
+struct PthreadBarrierPrivate;
+struct PthreadBarrierattrPrivate;
+
+extern "C" {
+
+int APS5_VABI pthread_barrier_init_nid_postfix(PthreadBarrierPrivate** barrier, PthreadBarrierattrPrivate* const* attr, unsigned count);
+int APS5_VABI pthread_barrier_wait_nid_postfix(PthreadBarrierPrivate** barrier);
+int APS5_VABI pthread_barrier_destroy_nid_postfix(PthreadBarrierPrivate** barrier);
+int APS5_VABI pthread_barrierattr_init_nid_postfix(PthreadBarrierattrPrivate** attr);
+int APS5_VABI pthread_barrierattr_destroy_nid_postfix(PthreadBarrierattrPrivate** attr);
+int APS5_VABI pthread_barrierattr_getpshared_nid_postfix(PthreadBarrierattrPrivate* const* attr, int* pshared);
+int APS5_VABI pthread_barrierattr_setpshared_nid_postfix(PthreadBarrierattrPrivate** attr, int pshared);
+int APS5_VABI pthread_getcpuclockid_nid_postfix(Pthread thread, int* clockId);
+int APS5_VABI flock_nid_postfix(int d, int operation);
+int APS5_VABI mlockall_nid_postfix(int flags);
+int APS5_VABI msync_nid_postfix(void* address, std::size_t length, int flags);
+int* APS5_VABI __error_nid_postfix();
+
+}
+
+namespace {
+
+int ToSceResult(int result) {
+    return result > 0 ? SceKernelError(result) : result;
+}
+
+int FromPosix(int result) {
+    return result == -1 ? SceKernelError(*__error_nid_postfix()) : result;
+}
+
+}
 
 extern "C" {
 
@@ -98,9 +131,10 @@ int APS5_VABI fchownat_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI fstat_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int64_t APS5_VABI _fstat_nid_postfix(int d, FileStat* sb);
+
+int APS5_VABI fstat_nid_postfix(int d, FileStat* sb) {
+    return static_cast<int>(_fstat_nid_postfix(d, sb));
 }
 
 int APS5_VABI futimesat_nid_postfix(void) {
@@ -528,9 +562,10 @@ int APS5_VABI ptrace_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI pwrite_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_t nbytes, int64_t offset);
+
+int64_t APS5_VABI pwrite_nid_postfix(int d, const void* buf, size_t nbytes, int64_t offset) {
+    return pwrite_nid_disambig1_nid_postfix(d, buf, nbytes, offset);
 }
 
 int APS5_VABI reboot_nid_postfix(void) {
@@ -848,9 +883,8 @@ int APS5_VABI sceKernelExpectedHddFormat(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelFlock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelFlock(int d, int operation) {
+    return FromPosix(flock_nid_postfix(d, operation));
 }
 
 int APS5_VABI sceKernelGetACInfoAllForCoredump(void) {
@@ -1728,14 +1762,12 @@ int APS5_VABI sceKernelMemoryPoolMove(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelMlockall(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelMlockall(int flags) {
+    return FromPosix(mlockall_nid_postfix(flags));
 }
 
-int APS5_VABI sceKernelMsync(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelMsync(void* address, std::size_t length, int flags) {
+    return FromPosix(msync_nid_postfix(address, length, flags));
 }
 
 int APS5_VABI sceKernelNormalizePath(void) {
@@ -2303,39 +2335,33 @@ int APS5_VABI scePthreadAttrSetscope(void) {
     return 0;
 }
 
-int APS5_VABI scePthreadBarrierDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierDestroy(PthreadBarrierPrivate** barrier) {
+    return ToSceResult(pthread_barrier_destroy_nid_postfix(barrier));
 }
 
-int APS5_VABI scePthreadBarrierInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierInit(PthreadBarrierPrivate** barrier, PthreadBarrierattrPrivate* const* attr, unsigned count, const char* name) {
+    (void)name;
+    return ToSceResult(pthread_barrier_init_nid_postfix(barrier, attr, count));
 }
 
-int APS5_VABI scePthreadBarrierWait(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierWait(PthreadBarrierPrivate** barrier) {
+    return ToSceResult(pthread_barrier_wait_nid_postfix(barrier));
 }
 
-int APS5_VABI scePthreadBarrierattrDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierattrDestroy(PthreadBarrierattrPrivate** attr) {
+    return ToSceResult(pthread_barrierattr_destroy_nid_postfix(attr));
 }
 
-int APS5_VABI scePthreadBarrierattrGetpshared(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierattrGetpshared(PthreadBarrierattrPrivate* const* attr, int* pshared) {
+    return ToSceResult(pthread_barrierattr_getpshared_nid_postfix(attr, pshared));
 }
 
-int APS5_VABI scePthreadBarrierattrInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierattrInit(PthreadBarrierattrPrivate** attr) {
+    return ToSceResult(pthread_barrierattr_init_nid_postfix(attr));
 }
 
-int APS5_VABI scePthreadBarrierattrSetpshared(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadBarrierattrSetpshared(PthreadBarrierattrPrivate** attr, int pshared) {
+    return ToSceResult(pthread_barrierattr_setpshared_nid_postfix(attr, pshared));
 }
 
 int APS5_VABI scePthreadCondattrGetclock(void) {
@@ -2348,9 +2374,8 @@ int APS5_VABI scePthreadGetconcurrency(void) {
     return 0;
 }
 
-int APS5_VABI scePthreadGetcpuclockid(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePthreadGetcpuclockid(Pthread thread, int* clockId) {
+    return ToSceResult(pthread_getcpuclockid_nid_postfix(thread, clockId));
 }
 
 int APS5_VABI scePthreadMain(void) {
