@@ -18,8 +18,12 @@ if(BUILD_TESTING)
     target_include_directories(guest_ces_dbcs_module_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_ces_dbcs_module_tests PRIVATE libSceCesCs-module)
     add_test(NAME guest_ces_dbcs_module COMMAND guest_ces_dbcs_module_tests)
+    add_test_executable(guest_ces_conversions_tests ${LIBS_INCLUDE_DIR}/tests/GuestCesConversions.cpp)
+    target_include_directories(guest_ces_conversions_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_ces_conversions_tests PRIVATE libSceCesCs)
+    add_test(NAME guest_ces_conversions COMMAND guest_ces_conversions_tests)
     if(WIN32)
-        set_tests_properties(guest_ces guest_ces_module guest_ces_dbcs guest_ces_dbcs_module PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_ces guest_ces_module guest_ces_dbcs guest_ces_dbcs_module guest_ces_conversions PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceCesCs>")
     endif()
 endif()

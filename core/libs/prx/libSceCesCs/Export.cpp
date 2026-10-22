@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -518,6 +519,202 @@ int mbcsToUtf8(bool accepted, const void* profile, const uint8_t* mbcs, uint32_t
     return 0;
 }
 
+constexpr bool NATIVE_BIG_ENDIAN = std::endian::native == std::endian::big;
+
+template<typename Unit>
+uint32_t loadUnit(const Unit* source, bool bigEndian) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(source);
+    uint32_t code = 0;
+    for (uint32_t i = 0; i < sizeof(Unit); ++i) code |= uint32_t(bytes[i]) << (8 * (bigEndian ? sizeof(Unit) - 1 - i : i));
+    return code;
+}
+
+template<typename Unit>
+void storeUnit(Unit* target, uint32_t code, bool bigEndian) {
+    auto* bytes = reinterpret_cast<uint8_t*>(target);
+    for (uint32_t i = 0; i < sizeof(Unit); ++i) bytes[i] = static_cast<uint8_t>(code >> (8 * (bigEndian ? sizeof(Unit) - 1 - i : i)));
+}
+
+int decodeUtf16(const uint16_t* source, uint32_t available, bool bigEndian, uint32_t& length, uint32_t& code) {
+    code = loadUnit(source, bigEndian);
+    length = 1;
+    if (code >= 0xDC00 && code <= 0xDFFF) return CES_ERROR_INVALID_ENCODE;
+    if (code >= 0xD800 && code <= 0xDBFF) {
+        if (available < 2) return CES_ERROR_SRC_BUFFER_END;
+        const uint32_t low = loadUnit(source + 1, bigEndian);
+        if (low < 0xDC00 || low > 0xDFFF) return CES_ERROR_INVALID_ENCODE;
+        code = 0x10000 + ((code - 0xD800) << 10) + low - 0xDC00;
+        length = 2;
+    }
+    return 0;
+}
+
+int decodeUtf32(uint32_t code) {
+    return code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) ? CES_ERROR_INVALID_ENCODE : 0;
+}
+
+int decodeSingle(bool accepted, const void* profile, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t& length, uint32_t& code) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!mbcs) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (mbcsMax == 0) return CES_ERROR_SRC_BUFFER_END;
+    return decodeMbcs(profile, mbcs, mbcsMax, length, code);
+}
+
+int mbcsToUcs2(bool accepted, const void* profile, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint16_t* ucs2) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!mbcs) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (mbcsMax == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!ucs2) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeMbcs(profile, mbcs, mbcsMax, length, code); result != 0) return result;
+    *ucs2 = static_cast<uint16_t>(code);
+    if (mbcsLen) *mbcsLen = length;
+    return 0;
+}
+
+int mbcsToUtf16(bool accepted, const void* profile, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, bool bigEndian) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!mbcs) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (mbcsMax == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!utf16) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeMbcs(profile, mbcs, mbcsMax, length, code); result != 0) return result;
+    if (utf16Max < 1) return CES_ERROR_DST_BUFFER_END;
+    storeUnit(utf16, code, bigEndian);
+    if (mbcsLen) *mbcsLen = length;
+    if (utf16Len) *utf16Len = 1;
+    return 0;
+}
+
+int mbcsToUtf32(bool accepted, const void* profile, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint32_t* utf32, bool bigEndian) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!mbcs) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (mbcsMax == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!utf32) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeMbcs(profile, mbcs, mbcsMax, length, code); result != 0) return result;
+    storeUnit(utf32, code, bigEndian);
+    if (mbcsLen) *mbcsLen = length;
+    return 0;
+}
+
+int codeToMbcs(bool accepted, const void* profile, uint32_t code, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!mbcs) return CES_ERROR_INVALID_DST_BUFFER;
+    if (const int result = decodeUtf32(code); result != 0) return result;
+    uint8_t encoded[3];
+    uint32_t size = 0;
+    if (const int result = encodeMbcs(profile, code, encoded, size); result != 0) return result;
+    if (mbcsMax < size) return CES_ERROR_DST_BUFFER_END;
+    std::memcpy(mbcs, encoded, size);
+    if (mbcsLen) *mbcsLen = size;
+    return 0;
+}
+
+int utf8ToMbcs(bool accepted, const uint8_t* utf8, uint32_t utf8Max, uint32_t* utf8Len, const void* profile, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf8) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (utf8Max == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!mbcs) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeUtf8(utf8, utf8Max, length, code); result != 0) return result;
+    if (const int result = codeToMbcs(true, profile, code, mbcs, mbcsMax, mbcsLen); result != 0) return result;
+    if (utf8Len) *utf8Len = length;
+    return 0;
+}
+
+int utf16ToMbcs(bool accepted, const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, const void* profile, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, bool bigEndian) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf16) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (utf16Max == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!mbcs) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeUtf16(utf16, utf16Max, bigEndian, length, code); result != 0) return result;
+    if (const int result = codeToMbcs(true, profile, code, mbcs, mbcsMax, mbcsLen); result != 0) return result;
+    if (utf16Len) *utf16Len = length;
+    return 0;
+}
+
+int utf32ToMbcs(bool accepted, const uint32_t* utf32, const void* profile, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, bool bigEndian) {
+    if (!accepted) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf32) return CES_ERROR_INVALID_SRC_BUFFER;
+    return codeToMbcs(true, profile, loadUnit(utf32, bigEndian), mbcs, mbcsMax, mbcsLen);
+}
+
+int sbcToUcs2(const uint8_t* profile, uint8_t sbc, uint16_t* ucs2) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!ucs2) return CES_ERROR_INVALID_DST_BUFFER;
+    *ucs2 = static_cast<uint16_t>(sbcToUnicode(profile, sbc));
+    return 0;
+}
+
+int sbcToUtf16(const uint8_t* profile, uint8_t sbc, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, bool bigEndian) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf16) return CES_ERROR_INVALID_DST_BUFFER;
+    if (utf16Max < 1) return CES_ERROR_DST_BUFFER_END;
+    storeUnit(utf16, sbcToUnicode(profile, sbc), bigEndian);
+    if (utf16Len) *utf16Len = 1;
+    return 0;
+}
+
+int sbcToUtf32(const uint8_t* profile, uint8_t sbc, uint32_t* utf32, bool bigEndian) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf32) return CES_ERROR_INVALID_DST_BUFFER;
+    storeUnit(utf32, sbcToUnicode(profile, sbc), bigEndian);
+    return 0;
+}
+
+int codeToSbc(uint32_t code, const uint8_t* profile, uint8_t* sbc) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!sbc) return CES_ERROR_INVALID_DST_BUFFER;
+    if (const int result = decodeUtf32(code); result != 0) return result;
+    return unicodeToSbc(profile, code, *sbc) ? 0 : CES_ERROR_UNASSIGNED_CODE;
+}
+
+int utf16ToSbc(const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, const uint8_t* profile, uint8_t* sbc, bool bigEndian) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf16) return CES_ERROR_INVALID_SRC_BUFFER;
+    if (utf16Max == 0) return CES_ERROR_SRC_BUFFER_END;
+    if (!sbc) return CES_ERROR_INVALID_DST_BUFFER;
+    uint32_t length = 0;
+    uint32_t code = 0;
+    if (const int result = decodeUtf16(utf16, utf16Max, bigEndian, length, code); result != 0) return result;
+    if (!unicodeToSbc(profile, code, *sbc)) return CES_ERROR_UNASSIGNED_CODE;
+    if (utf16Len) *utf16Len = length;
+    return 0;
+}
+
+int utf32ToSbc(const uint32_t* utf32, const uint8_t* profile, uint8_t* sbc, bool bigEndian) {
+    if (!isSbc(profile)) return CES_ERROR_INVALID_PARAMETER;
+    if (!utf32) return CES_ERROR_INVALID_SRC_BUFFER;
+    return codeToSbc(loadUnit(utf32, bigEndian), profile, sbc);
+}
+
+int decodeNativeUtf16(const uint16_t* utf16, uint32_t utf16Max, uint32_t& length, uint32_t& code) {
+    return decodeUtf16(utf16, utf16Max, NATIVE_BIG_ENDIAN, length, code);
+}
+
+int decodeNativeUtf32(const uint32_t* utf32, uint32_t, uint32_t& length, uint32_t& code) {
+    length = 1;
+    code = utf32[0];
+    return decodeUtf32(code);
+}
+
+uint32_t encodeNativeUtf16(uint32_t code, uint16_t* utf16) {
+    utf16[0] = static_cast<uint16_t>(code);
+    return 1;
+}
+
+uint32_t encodeNativeUtf32(uint32_t code, uint32_t* utf32) {
+    utf32[0] = code;
+    return 1;
+}
+
 }
 
 extern "C" {
@@ -674,4 +871,392 @@ int APS5_VABI sceCesUhcToUtf8(void* profile, uint8_t* uhcBuffer, uint32_t uhcMax
     return mbcsToUtf8(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf8Buffer, utf8Max, utf8Length);
 }
 
+
+int APS5_VABI sceCesBig5ToUcs2(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint16_t* ucs2) {
+    return mbcsToUcs2(isBig5(profile), profile, big5Buffer, big5Max, big5Length, ucs2);
+}
+
+int APS5_VABI sceCesBig5ToUtf16(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf16Buffer, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesBig5ToUtf32(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint32_t* utf32) {
+    return mbcsToUtf32(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToBig5(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf16ToMbcs(isBig5(profile), utf16Buffer, utf16Max, utf16Length, profile, big5Buffer, big5Max, big5Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesBig5ToUtf16be(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf16Buffer, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesBig5ToUtf32be(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint32_t* utf32) {
+    return mbcsToUtf32(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToBig5(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf16ToMbcs(isBig5(profile), utf16Buffer, utf16Max, utf16Length, profile, big5Buffer, big5Max, big5Length, true);
+}
+
+int APS5_VABI sceCesUtf32beToBig5(const uint32_t* utf32, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf32ToMbcs(isBig5(profile), utf32, profile, big5Buffer, big5Max, big5Length, true);
+}
+
+int APS5_VABI sceCesBig5ToUtf16le(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf16Buffer, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesBig5ToUtf32le(const void* profile, const uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length, uint32_t* utf32) {
+    return mbcsToUtf32(isBig5(profile), profile, big5Buffer, big5Max, big5Length, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToBig5(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf16ToMbcs(isBig5(profile), utf16Buffer, utf16Max, utf16Length, profile, big5Buffer, big5Max, big5Length, false);
+}
+
+int APS5_VABI sceCesUtf32leToBig5(const uint32_t* utf32, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf32ToMbcs(isBig5(profile), utf32, profile, big5Buffer, big5Max, big5Length, false);
+}
+
+int APS5_VABI sceCesUtf8ToBig5(const uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return utf8ToMbcs(isBig5(profile), utf8Buffer, utf8Max, utf8Length, profile, big5Buffer, big5Max, big5Length);
+}
+
+int APS5_VABI sceCesUcs2ToBig5(uint16_t ucs2, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return codeToMbcs(isBig5(profile), profile, ucs2, big5Buffer, big5Max, big5Length);
+}
+
+int APS5_VABI sceCesUtf32ToBig5(uint32_t utf32, const void* profile, uint8_t* big5Buffer, uint32_t big5Max, uint32_t* big5Length) {
+    return codeToMbcs(isBig5(profile), profile, utf32, big5Buffer, big5Max, big5Length);
+}
+
+int APS5_VABI sceCesEucJpToUtf16(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesEucJpToUtf32(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToEucJp(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucJp(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesEucJpToUtf16be(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesEucJpToUtf32be(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToEucJp(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucJp(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, true);
+}
+
+int APS5_VABI sceCesUtf32beToEucJp(const uint32_t* utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf32ToMbcs(isEucJp(profile), utf32, profile, eucBuffer, eucMax, eucLength, true);
+}
+
+int APS5_VABI sceCesEucJpToUtf16le(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesEucJpToUtf32le(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucJp(profile), profile, eucBuffer, eucMax, eucLength, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToEucJp(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucJp(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, false);
+}
+
+int APS5_VABI sceCesUtf32leToEucJp(const uint32_t* utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf32ToMbcs(isEucJp(profile), utf32, profile, eucBuffer, eucMax, eucLength, false);
+}
+
+int APS5_VABI sceCesUtf8ToEucJp(const uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf8ToMbcs(isEucJp(profile), utf8Buffer, utf8Max, utf8Length, profile, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesUcs2ToEucJp(uint16_t ucs2, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return codeToMbcs(isEucJp(profile), profile, ucs2, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesUtf32ToEucJp(uint32_t utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return codeToMbcs(isEucJp(profile), profile, utf32, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesEucKrToUcs2(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* ucs2) {
+    return mbcsToUcs2(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, ucs2);
+}
+
+int APS5_VABI sceCesEucKrToUtf16(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesEucKrToUtf32(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToEucKr(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucKr(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesEucKrToUtf16be(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesEucKrToUtf32be(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToEucKr(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucKr(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, true);
+}
+
+int APS5_VABI sceCesUtf32beToEucKr(const uint32_t* utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf32ToMbcs(isEucKr(profile), utf32, profile, eucBuffer, eucMax, eucLength, true);
+}
+
+int APS5_VABI sceCesEucKrToUtf16le(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf16Buffer, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesEucKrToUtf32le(const void* profile, const uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength, uint32_t* utf32) {
+    return mbcsToUtf32(isEucKr(profile), profile, eucBuffer, eucMax, eucLength, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToEucKr(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf16ToMbcs(isEucKr(profile), utf16Buffer, utf16Max, utf16Length, profile, eucBuffer, eucMax, eucLength, false);
+}
+
+int APS5_VABI sceCesUtf32leToEucKr(const uint32_t* utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf32ToMbcs(isEucKr(profile), utf32, profile, eucBuffer, eucMax, eucLength, false);
+}
+
+int APS5_VABI sceCesUtf8ToEucKr(const uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return utf8ToMbcs(isEucKr(profile), utf8Buffer, utf8Max, utf8Length, profile, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesUcs2ToEucKr(uint16_t ucs2, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return codeToMbcs(isEucKr(profile), profile, ucs2, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesUtf32ToEucKr(uint32_t utf32, const void* profile, uint8_t* eucBuffer, uint32_t eucMax, uint32_t* eucLength) {
+    return codeToMbcs(isEucKr(profile), profile, utf32, eucBuffer, eucMax, eucLength);
+}
+
+int APS5_VABI sceCesSJisToUcs2(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint16_t* ucs2) {
+    return mbcsToUcs2(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, ucs2);
+}
+
+int APS5_VABI sceCesSJisToUtf8(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length) {
+    return mbcsToUtf8(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf8Buffer, utf8Max, utf8Length);
+}
+
+int APS5_VABI sceCesSJisToUtf16(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf16Buffer, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesSJisToUtf32(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint32_t* utf32) {
+    return mbcsToUtf32(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToSJis(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf16ToMbcs(isSjis(profile), utf16Buffer, utf16Max, utf16Length, profile, sjisBuffer, sjisMax, sjisLength, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesSJisToUtf16be(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf16Buffer, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesSJisToUtf32be(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint32_t* utf32) {
+    return mbcsToUtf32(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToSJis(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf16ToMbcs(isSjis(profile), utf16Buffer, utf16Max, utf16Length, profile, sjisBuffer, sjisMax, sjisLength, true);
+}
+
+int APS5_VABI sceCesUtf32beToSJis(const uint32_t* utf32, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf32ToMbcs(isSjis(profile), utf32, profile, sjisBuffer, sjisMax, sjisLength, true);
+}
+
+int APS5_VABI sceCesSJisToUtf16le(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf16Buffer, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesSJisToUtf32le(const void* profile, const uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength, uint32_t* utf32) {
+    return mbcsToUtf32(isSjis(profile), profile, sjisBuffer, sjisMax, sjisLength, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToSJis(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf16ToMbcs(isSjis(profile), utf16Buffer, utf16Max, utf16Length, profile, sjisBuffer, sjisMax, sjisLength, false);
+}
+
+int APS5_VABI sceCesUtf32leToSJis(const uint32_t* utf32, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf32ToMbcs(isSjis(profile), utf32, profile, sjisBuffer, sjisMax, sjisLength, false);
+}
+
+int APS5_VABI sceCesUtf8ToSJis(const uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return utf8ToMbcs(isSjis(profile), utf8Buffer, utf8Max, utf8Length, profile, sjisBuffer, sjisMax, sjisLength);
+}
+
+int APS5_VABI sceCesUcs2ToSJis(uint16_t ucs2, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return codeToMbcs(isSjis(profile), profile, ucs2, sjisBuffer, sjisMax, sjisLength);
+}
+
+int APS5_VABI sceCesUtf32ToSJis(uint32_t utf32, const void* profile, uint8_t* sjisBuffer, uint32_t sjisMax, uint32_t* sjisLength) {
+    return codeToMbcs(isSjis(profile), profile, utf32, sjisBuffer, sjisMax, sjisLength);
+}
+
+int APS5_VABI sceCesUhcToUcs2(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint16_t* ucs2) {
+    return mbcsToUcs2(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, ucs2);
+}
+
+int APS5_VABI sceCesUhcToUtf16(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf16Buffer, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUhcToUtf32(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint32_t* utf32) {
+    return mbcsToUtf32(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToUhc(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf16ToMbcs(isUhc(profile), utf16Buffer, utf16Max, utf16Length, profile, uhcBuffer, uhcMax, uhcLength, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUhcToUtf16be(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf16Buffer, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesUhcToUtf32be(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint32_t* utf32) {
+    return mbcsToUtf32(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToUhc(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf16ToMbcs(isUhc(profile), utf16Buffer, utf16Max, utf16Length, profile, uhcBuffer, uhcMax, uhcLength, true);
+}
+
+int APS5_VABI sceCesUtf32beToUhc(const uint32_t* utf32, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf32ToMbcs(isUhc(profile), utf32, profile, uhcBuffer, uhcMax, uhcLength, true);
+}
+
+int APS5_VABI sceCesUhcToUtf16le(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length) {
+    return mbcsToUtf16(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf16Buffer, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesUhcToUtf32le(const void* profile, const uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength, uint32_t* utf32) {
+    return mbcsToUtf32(isUhc(profile), profile, uhcBuffer, uhcMax, uhcLength, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToUhc(const uint16_t* utf16Buffer, uint32_t utf16Max, uint32_t* utf16Length, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf16ToMbcs(isUhc(profile), utf16Buffer, utf16Max, utf16Length, profile, uhcBuffer, uhcMax, uhcLength, false);
+}
+
+int APS5_VABI sceCesUtf32leToUhc(const uint32_t* utf32, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf32ToMbcs(isUhc(profile), utf32, profile, uhcBuffer, uhcMax, uhcLength, false);
+}
+
+int APS5_VABI sceCesUtf8ToUhc(const uint8_t* utf8Buffer, uint32_t utf8Max, uint32_t* utf8Length, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return utf8ToMbcs(isUhc(profile), utf8Buffer, utf8Max, utf8Length, profile, uhcBuffer, uhcMax, uhcLength);
+}
+
+int APS5_VABI sceCesUcs2ToUhc(uint16_t ucs2, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return codeToMbcs(isUhc(profile), profile, ucs2, uhcBuffer, uhcMax, uhcLength);
+}
+
+int APS5_VABI sceCesUtf32ToUhc(uint32_t utf32, const void* profile, uint8_t* uhcBuffer, uint32_t uhcMax, uint32_t* uhcLength) {
+    return codeToMbcs(isUhc(profile), profile, utf32, uhcBuffer, uhcMax, uhcLength);
+}
+
+int APS5_VABI sceCesSbcToUcs2(const uint8_t* profile, uint8_t sbc, uint16_t* ucs2) {
+    return sbcToUcs2(profile, sbc, ucs2);
+}
+
+int APS5_VABI sceCesSbcToUtf16(const uint8_t* profile, uint8_t sbc, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length) {
+    return sbcToUtf16(profile, sbc, utf16, utf16Max, utf16Length, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesSbcToUtf32(const uint8_t* profile, uint8_t sbc, uint32_t* utf32) {
+    return sbcToUtf32(profile, sbc, utf32, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesUtf16ToSbc(const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length, const uint8_t* profile, uint8_t* sbc) {
+    return utf16ToSbc(utf16, utf16Max, utf16Length, profile, sbc, NATIVE_BIG_ENDIAN);
+}
+
+int APS5_VABI sceCesSbcToUtf16be(const uint8_t* profile, uint8_t sbc, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length) {
+    return sbcToUtf16(profile, sbc, utf16, utf16Max, utf16Length, true);
+}
+
+int APS5_VABI sceCesSbcToUtf32be(const uint8_t* profile, uint8_t sbc, uint32_t* utf32) {
+    return sbcToUtf32(profile, sbc, utf32, true);
+}
+
+int APS5_VABI sceCesUtf16beToSbc(const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length, const uint8_t* profile, uint8_t* sbc) {
+    return utf16ToSbc(utf16, utf16Max, utf16Length, profile, sbc, true);
+}
+
+int APS5_VABI sceCesUtf32beToSbc(const uint32_t* utf32, const uint8_t* profile, uint8_t* sbc) {
+    return utf32ToSbc(utf32, profile, sbc, true);
+}
+
+int APS5_VABI sceCesSbcToUtf16le(const uint8_t* profile, uint8_t sbc, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length) {
+    return sbcToUtf16(profile, sbc, utf16, utf16Max, utf16Length, false);
+}
+
+int APS5_VABI sceCesSbcToUtf32le(const uint8_t* profile, uint8_t sbc, uint32_t* utf32) {
+    return sbcToUtf32(profile, sbc, utf32, false);
+}
+
+int APS5_VABI sceCesUtf16leToSbc(const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Length, const uint8_t* profile, uint8_t* sbc) {
+    return utf16ToSbc(utf16, utf16Max, utf16Length, profile, sbc, false);
+}
+
+int APS5_VABI sceCesUtf32leToSbc(const uint32_t* utf32, const uint8_t* profile, uint8_t* sbc) {
+    return utf32ToSbc(utf32, profile, sbc, false);
+}
+
+int APS5_VABI sceCesUcs2ToSbc(uint16_t ucs2, const uint8_t* profile, uint8_t* sbc) {
+    return codeToSbc(ucs2, profile, sbc);
+}
+
+int APS5_VABI sceCesUtf32ToSbc(uint32_t utf32, const uint8_t* profile, uint8_t* sbc) {
+    return codeToSbc(utf32, profile, sbc);
+}
+
+int APS5_VABI sceCesMbcsStrToUtf16Str(void* context, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len) {
+    return utf16 ? fromMbcs(context, mbcs, mbcsMax, mbcsLen, utf16, utf16Max, utf16Len, encodeNativeUtf16) : CES_ERROR_INVALID_DST_BUFFER;
+}
+
+int APS5_VABI sceCesMbcsStrGetUtf16Len(void* context, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint32_t* utf16Len) {
+    return fromMbcs(context, mbcs, mbcsMax, mbcsLen, static_cast<uint16_t*>(nullptr), 0, utf16Len, encodeNativeUtf16);
+}
+
+int APS5_VABI sceCesMbcsStrToUtf32Str(void* context, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint32_t* utf32, uint32_t utf32Max, uint32_t* utf32Len) {
+    return utf32 ? fromMbcs(context, mbcs, mbcsMax, mbcsLen, utf32, utf32Max, utf32Len, encodeNativeUtf32) : CES_ERROR_INVALID_DST_BUFFER;
+}
+
+int APS5_VABI sceCesMbcsStrGetUtf32Len(void* context, const uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen, uint32_t* utf32Len) {
+    return fromMbcs(context, mbcs, mbcsMax, mbcsLen, static_cast<uint32_t*>(nullptr), 0, utf32Len, encodeNativeUtf32);
+}
+
+int APS5_VABI sceCesUtf16StrToMbcsStr(void* context, const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen) {
+    return mbcs ? toMbcs(context, utf16, utf16Max, utf16Len, mbcs, mbcsMax, mbcsLen, decodeNativeUtf16) : CES_ERROR_INVALID_DST_BUFFER;
+}
+
+int APS5_VABI sceCesUtf16StrGetMbcsLen(void* context, const uint16_t* utf16, uint32_t utf16Max, uint32_t* utf16Len, uint32_t* mbcsLen) {
+    return toMbcs(context, utf16, utf16Max, utf16Len, nullptr, 0, mbcsLen, decodeNativeUtf16);
+}
+
+int APS5_VABI sceCesUtf32StrToMbcsStr(void* context, const uint32_t* utf32, uint32_t utf32Max, uint32_t* utf32Len, uint8_t* mbcs, uint32_t mbcsMax, uint32_t* mbcsLen) {
+    return mbcs ? toMbcs(context, utf32, utf32Max, utf32Len, mbcs, mbcsMax, mbcsLen, decodeNativeUtf32) : CES_ERROR_INVALID_DST_BUFFER;
+}
+
+int APS5_VABI sceCesUtf32StrGetMbcsLen(void* context, const uint32_t* utf32, uint32_t utf32Max, uint32_t* utf32Len, uint32_t* mbcsLen) {
+    return toMbcs(context, utf32, utf32Max, utf32Len, nullptr, 0, mbcsLen, decodeNativeUtf32);
+}
 }
