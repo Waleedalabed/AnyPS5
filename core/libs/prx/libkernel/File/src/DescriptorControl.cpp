@@ -595,15 +595,4 @@ bool IsVnode(int fd) {
 #endif
 }
 
-bool LastDescriptorOfOpenFile(int fd) {
-    std::lock_guard lock(g_mutex);
-    const auto found = g_entries.find(fd);
-    return found == g_entries.end() || found->second.status.use_count() == 1;
-}
-
-bool OpenFileWrites(int fd) {
-    const auto kind = Classify(fd, "close");
-    return kind == Kind::File && AccessMode(fd, "close") != ReadOnly;
-}
-
 }
