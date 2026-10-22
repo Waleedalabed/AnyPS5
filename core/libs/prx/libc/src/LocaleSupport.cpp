@@ -317,6 +317,23 @@ void APS5_VABI _ZNSt8ios_baseD2Ev_nid_postfix(GuestLocale::IosBase* self) {
     self->locale = nullptr;
 }
 
+GuestLocale::IosBase* APS5_VABI SetStreamWidth(GuestLocale::IosBase* stream, std::int32_t width) {
+    if (stream == nullptr) throw std::invalid_argument("setw: null stream");
+    stream->width = width;
+    return stream;
+}
+
+struct StreamManipulator {
+    GuestLocale::IosBase* (APS5_VABI* function)(GuestLocale::IosBase*, std::int32_t);
+    std::int32_t argument;
+};
+
+static_assert(sizeof(StreamManipulator) == 0x10);
+
+StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width) {
+    return {&SetStreamWidth, width};
+}
+
 void APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(GuestLocale::IosBase* self) {
     if (self == nullptr) throw std::invalid_argument("ios_base _Addstd: null stream");
     std::lock_guard lock(g_standardStreamMutex);

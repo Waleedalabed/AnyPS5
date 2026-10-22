@@ -19,6 +19,11 @@ void APS5_VABI _ZNSt6locale5facet9_RegisterEv_nid_postfix(GuestLocale::Facet* se
 void APS5_VABI _ZNSt8_LocinfoC1EPKc_nid_postfix(GuestLocale::LocinfoStorage* self, const char* localeName);
 void APS5_VABI _ZNSt8_LocinfoD1Ev_nid_postfix(GuestLocale::LocinfoStorage* self);
 void APS5_VABI _ZNSt8ios_baseD2Ev_nid_postfix(GuestLocale::IosBase* self);
+struct StreamManipulator {
+    GuestLocale::IosBase* (APS5_VABI* function)(GuestLocale::IosBase*, std::int32_t);
+    std::int32_t argument;
+};
+StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width);
 void APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(GuestLocale::IosBase* self);
 const short* APS5_VABI _Getpctype_nid_postfix();
 const short* APS5_VABI _Getptolower_nid_postfix();
@@ -153,6 +158,25 @@ static void CheckStreamDestruction() {
     Require(object.stream.locale == &_ZSt21_sceLibcClassicLocale_nid_postfix);
 }
 
+static void CheckStreamWidth() {
+    struct GuardedStream {
+        std::uint64_t before = 0x12345678;
+        GuestLocale::IosBase stream{};
+        std::uint64_t after = 0x87654321;
+    } object;
+    object.stream.flags = 0x4000;
+    object.stream.precision = 6;
+    const auto manipulator = _ZSt4setwi_nid_postfix(12);
+    Require(manipulator.argument == 12 && manipulator.function != nullptr);
+    Require(manipulator.function(&object.stream, manipulator.argument) == &object.stream);
+    Require(object.stream.width == 12 && object.stream.flags == 0x4000 && object.stream.precision == 6);
+    Require(object.before == 0x12345678 && object.after == 0x87654321);
+    const auto reset = _ZSt4setwi_nid_postfix(0);
+    reset.function(&object.stream, reset.argument);
+    Require(object.stream.width == 0);
+    RequireException([&] { manipulator.function(nullptr, manipulator.argument); });
+}
+
 static void CheckStandardStreams() {
     struct GuardedStream {
         std::uint64_t before = 0x12345678;
@@ -222,6 +246,7 @@ int main() {
     CheckCharacterTables();
     CheckCharacterConversions();
     CheckStreamDestruction();
+    CheckStreamWidth();
     CheckStandardStreams();
     CheckWideCaseTranslation();
     _Locksyslock_nid_postfix();
