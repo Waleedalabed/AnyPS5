@@ -4,7 +4,7 @@
 #include "SceTypes.hpp"
 #include <cstdint>
 
-extern "C" int APS5_VABI sceAgcAcquireMemSetEngine(std::uint32_t* cmd, std::uint32_t engine);
+extern "C" int APS5_VABI sceAgcAcquireMemSetEngine(std::uint32_t* cmd, std::uint8_t engine);
 
 #endif
 

@@ -95,7 +95,7 @@ int APS5_VABI sceAgcAsyncWriteDataPatchSetCachePolicy(std::uint32_t* cmd, std::u
     return SetWriteDataCachePolicy(cmd, cachePolicy, __func__);
 }
 
-int APS5_VABI sceAgcAcquireMemSetEngine(std::uint32_t* cmd, std::uint32_t engine) {
+int APS5_VABI sceAgcAcquireMemSetEngine(std::uint32_t* cmd, std::uint8_t engine) {
     Agc::Command::ValidatePacket(cmd, 0x58u, 8, __func__);
     Agc::Command::CheckBits(engine, 1, __func__);
     cmd[1] = (cmd[1] & 0x7fffffffu) | (engine << 31u);
